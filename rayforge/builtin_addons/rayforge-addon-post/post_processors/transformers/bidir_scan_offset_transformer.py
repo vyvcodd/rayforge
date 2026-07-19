@@ -15,15 +15,17 @@ if TYPE_CHECKING:
 
 class BidirScanOffsetTransformer(OpsTransformer):
     """
-    Corrects the X misalignment between left-to-right and right-to-left
-    raster passes seen on machines with a fixed mechanical/firmware skew
-    between scan directions.
+    Corrects the positional misalignment between raster passes running
+    in opposite directions, seen on machines with a fixed mechanical/
+    firmware skew between scan directions.
 
     For every raster pass (a MoveTo immediately followed by a ScanLine),
-    if the pass runs right-to-left, both its entry MoveTo and its ScanLine
-    endpoint are shifted along X by the configured offset. Left-to-right
-    passes are left untouched. Running after overscan means any lead-in/
-    lead-out already baked into the pass is shifted along with it.
+    if the pass runs opposite the raster's scan direction, both its
+    entry MoveTo and its ScanLine endpoint are shifted along that scan
+    direction by the configured offset. Passes running with the scan
+    direction are left untouched. Running after overscan means any
+    lead-in/lead-out already baked into the pass is shifted along with
+    it.
     """
 
     def __init__(self, enabled: bool = True):
@@ -40,8 +42,8 @@ class BidirScanOffsetTransformer(OpsTransformer):
     @property
     def description(self) -> str:
         return _(
-            "Shifts right-to-left raster passes along X to correct "
-            "scan-direction skew."
+            "Shifts raster passes running opposite the scan direction "
+            "to correct scan-direction skew."
         )
 
     def to_spec(
@@ -51,7 +53,10 @@ class BidirScanOffsetTransformer(OpsTransformer):
         settings: Optional[Dict[str, Any]],
     ) -> BidirScanOffsetSpec:
         offset = settings.get("bidir_x_offset_mm", 0.0) if settings else 0.0
-        return BidirScanOffsetSpec(offset_mm=offset)
+        scan_angle = settings.get("scan_angle", 0.0) if settings else 0.0
+        return BidirScanOffsetSpec(
+            offset_mm=offset, scan_angle_deg=scan_angle
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {**super().to_dict()}

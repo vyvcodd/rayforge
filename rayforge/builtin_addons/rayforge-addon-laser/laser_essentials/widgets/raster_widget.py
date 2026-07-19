@@ -393,6 +393,9 @@ class RasterSettingsWidget(DebounceMixin, StepComponentSettingsWidget):
             adjustment=bidir_x_offset_adj,
             digits=3,
         )
+        # Reserve room for a leading "-", otherwise negative values get
+        # their last decimal clipped.
+        self.bidir_x_offset_row.set_width_chars(8)
         self.bidir_x_offset_row.connect(
             "changed",
             lambda r: self._debounce(

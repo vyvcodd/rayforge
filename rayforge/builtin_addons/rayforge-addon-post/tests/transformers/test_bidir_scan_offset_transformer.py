@@ -113,6 +113,42 @@ def test_negative_offset_shifts_left(transformer: BidirScanOffsetTransformer):
     assert ops.endpoint(3) == pytest.approx((-0.5, 0.5, 0.0))
 
 
+def _build_vertical_zigzag() -> Ops:
+    """Three-column zigzag raster (scan_angle=90): col0 bottom-to-top,
+    col1 top-to-bottom, col2 bottom-to-top."""
+    ops = Ops()
+    ops.move_to(0.6, 0.0, 0.0)
+    ops.scan_to(0.6, 2.0, 0.0, power_values=[200, 200, 200, 200])
+    ops.move_to(0.5, 2.0, 0.0)
+    ops.scan_to(0.5, 0.0, 0.0, power_values=[210, 210, 210, 210])
+    ops.move_to(0.4, 0.0, 0.0)
+    ops.scan_to(0.4, 2.0, 0.0, power_values=[220, 220, 220, 220])
+    return ops
+
+
+def test_shifts_along_scan_direction_at_90_degrees(
+    transformer: BidirScanOffsetTransformer,
+):
+    """settings["scan_angle"] must reach the raygeo spec so the shift
+    lands on Y, not the hardcoded X assumption."""
+    ops = _build_vertical_zigzag()
+
+    _apply(
+        transformer,
+        ops,
+        settings={"bidir_x_offset_mm": 0.3, "scan_angle": 90.0},
+    )
+
+    # Columns 0 and 2 (bottom-to-top): untouched.
+    assert ops.endpoint(0) == pytest.approx((0.6, 0.0, 0.0), abs=1e-9)
+    assert ops.endpoint(1) == pytest.approx((0.6, 2.0, 0.0), abs=1e-9)
+    assert ops.endpoint(4) == pytest.approx((0.4, 0.0, 0.0), abs=1e-9)
+    assert ops.endpoint(5) == pytest.approx((0.4, 2.0, 0.0), abs=1e-9)
+    # Column 1 (top-to-bottom): shifted along Y, not X.
+    assert ops.endpoint(2) == pytest.approx((0.5, 2.3, 0.0), abs=1e-9)
+    assert ops.endpoint(3) == pytest.approx((0.5, 0.3, 0.0), abs=1e-9)
+
+
 def test_preserves_intermediate_state_commands(
     transformer: BidirScanOffsetTransformer,
 ):

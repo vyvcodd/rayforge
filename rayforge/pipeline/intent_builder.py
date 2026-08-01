@@ -951,8 +951,13 @@ class IntentBuilder:
         calls ``to_spec`` to produce the typed spec the Rust compute
         and aggregate stages consume.  ``workpiece`` is forwarded so
         that position-sensitive transformers (e.g. CropTransformer)
-        can resolve their regions, and ``step`` provides the
-        step-specific settings (see :meth:`_transformer_settings`).
+        can resolve their regions. ``step`` is forwarded (via
+        :meth:`_transformer_settings`) so transformers whose
+        parameters live on the step -- e.g.
+        ``BidirScanOffsetTransformer.bidir_x_offset_mm``,
+        ``TabsTransformer.tab_power`` -- actually receive them; see
+        :meth:`_transformer_settings`'s docstring for why this isn't
+        optional.
         """
         transformers: list[OpsTransformer] = []
         for t_dict in transformer_dicts:
@@ -1006,16 +1011,30 @@ class IntentBuilder:
     ) -> dict[str, Any] | None:
         """Return the settings dict forwarded to ``to_spec``.
 
-        Currently this carries the ``driver_native_overscan`` flag so
+        This carries the ``driver_native_overscan`` flag so
         :class:`OverscanTransformer` can short-circuit when the
         machine driver handles overscan itself, the machine
         kinematics so acceleration-aware transformers (e.g. the
         scanline merging inside :class:`Optimize`) can build their
         specs from them, and the machine's bidirectional scan offset
-        table. With a ``step`` it adds the step's speed and its own
-        bidirectional scan offset for :class:`BidirScanOffsetTransformer`.
+        table.
+
+        With a ``step``, it is also *every* transformer's only view of
+        step-level configuration -- ``to_spec(workpiece, stock,
+        settings)`` has no other way to reach values like
+        ``BidirScanOffsetTransformer``'s ``bidir_x_offset_mm`` and
+        ``scan_angle`` or ``TabsTransformer``'s ``tab_power``/
+        ``power``, which live on the :class:`Step`, not on the
+        transformer instance itself (``OpsTransformer.from_dict`` only
+        ever restores ``enabled`` for these). So the step's full
+        ``to_dict()`` is the base, not a curated subset: a missing key
+        fails silently, since the resulting spec's default (e.g.
+        offset_mm 0.0) is a *valid* value -- there's no signal short
+        of comparing actual output against the configured setting.
+        See PLAN_burn_preview.md's bidir-scan-offset investigation for
+        how this was found.
         """
-        settings: dict[str, Any] = {}
+        settings: dict[str, Any] = step.to_dict() if step is not None else {}
         if self._machine is not None:
             try:
                 native = bool(self._machine.driver.native_overscan)

@@ -515,6 +515,7 @@ class IntentBuilder:
         step.populate_payload(payload, self._machine)
         payload.transformers = self._build_transformer_specs(
             step.per_workpiece_transformers_dicts,
+            step=step,
             workpiece=wp,
         )
 
@@ -558,6 +559,7 @@ class IntentBuilder:
         self,
         transformer_dicts: list[dict[str, Any]],
         *,
+        step: Step,
         workpiece: WorkPiece | None = None,
     ) -> list[Any]:
         """Build typed Rust ``*Spec`` pyclasses from a list of
@@ -567,7 +569,13 @@ class IntentBuilder:
         calls ``to_spec`` to produce the typed spec the Rust compute
         and aggregate stages consume.  ``workpiece`` is forwarded so
         that position-sensitive transformers (e.g. CropTransformer)
-        can resolve their regions.
+        can resolve their regions. ``step`` is forwarded (via
+        :meth:`_transformer_settings`) so transformers whose
+        parameters live on the step -- e.g.
+        ``BidirScanOffsetTransformer.bidir_x_offset_mm``,
+        ``TabsTransformer.tab_power`` -- actually receive them; see
+        :meth:`_transformer_settings`'s docstring for why this isn't
+        optional.
         """
         transformers: list[OpsTransformer] = []
         for t_dict in transformer_dicts:
@@ -593,7 +601,7 @@ class IntentBuilder:
         if not transformers:
             return []
         stock = self._resolve_stock_geometries()
-        settings = self._transformer_settings()
+        settings = self._transformer_settings(step)
 
         specs: list = []
         for t in transformers:
@@ -602,20 +610,37 @@ class IntentBuilder:
             specs.append(t.to_spec(workpiece, stock, settings))
         return specs
 
-    def _transformer_settings(self) -> dict[str, Any] | None:
+    def _transformer_settings(self, step: Step) -> dict[str, Any]:
         """Return the settings dict forwarded to ``to_spec``.
 
-        Currently this carries the ``driver_native_overscan`` flag so
-        :class:`OverscanTransformer` can short-circuit when the
-        machine driver handles overscan itself.
+        This is *every* transformer's only view of step-level
+        configuration -- ``to_spec(workpiece, stock, settings)`` has
+        no other way to reach values like
+        ``BidirScanOffsetTransformer``'s ``bidir_x_offset_mm`` or
+        ``TabsTransformer``'s ``tab_power``/``power``, which live on
+        the :class:`Step`, not on the transformer instance itself
+        (``OpsTransformer.from_dict`` only ever restores ``enabled``
+        for these). So this has to be the step's full ``to_dict()``,
+        not a curated subset -- a previous version only included
+        ``driver_native_overscan`` (which is *not* on the step; it's
+        derived from the machine driver, folded in below), which
+        silently zeroed out both of those settings for every real job
+        since the migration to spec-based transformer dispatch. See
+        PLAN_burn_preview.md's bidir-scan-offset investigation for how
+        this was found: the resulting spec's default (e.g. offset_mm
+        0.0) is a *valid* value, so this fails silently rather than
+        raising -- there's no signal short of comparing actual output
+        against the configured setting.
         """
-        if self._machine is None:
-            return None
-        try:
-            native = bool(self._machine.driver.native_overscan)
-        except AttributeError:
-            native = False
-        return {"driver_native_overscan": native}
+        settings = step.to_dict()
+        native_overscan = False
+        if self._machine is not None:
+            try:
+                native_overscan = bool(self._machine.driver.native_overscan)
+            except AttributeError:
+                native_overscan = False
+        settings["driver_native_overscan"] = native_overscan
+        return settings
 
     def _resolve_stock_geometries(self) -> list[Any] | None:
         """Return the world-space stock boundary geometries.
@@ -723,7 +748,8 @@ class IntentBuilder:
             wrap_end=[],
             machine=self._machine_params(),
             transformers=self._build_transformer_specs(
-                step.per_step_transformers_dicts
+                step.per_step_transformers_dicts,
+                step=step,
             ),
         )
         return StageSpec.Aggregate(spec=spec)

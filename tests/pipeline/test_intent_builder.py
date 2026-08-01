@@ -1168,6 +1168,75 @@ def test_step_aggregate_carries_per_step_transformers(
     assert len(spec.transformers) > 0
 
 
+def test_bidir_scan_offset_receives_step_configured_value(
+    engrave_step_class, test_machine_and_config
+):
+    """Regression test: to_spec(workpiece, stock, settings) has no way
+    to reach step-level transformer config except through
+    IntentBuilder's settings dict (see _transformer_settings's
+    docstring) -- OpsTransformer.from_dict only ever restores
+    ``enabled``, not e.g. bidir_x_offset_mm, which lives on the Step.
+
+    A prior version of that settings dict only carried
+    driver_native_overscan, which silently zeroed out
+    BidirScanOffsetTransformer.bidir_x_offset_mm (and would do the
+    same to TabsTransformer's tab_power/power) for every real job
+    since the migration to spec-based transformer dispatch, with no
+    error: 0.0 is a *valid* offset, so this failed silently rather
+    than raising. len(payload.transformers) > 0 in the tests above
+    doesn't catch this -- it only proves a spec was built, not that
+    it carries the right value.
+    """
+    from raygeo.ops.transform.bidir_scan_offset import BidirScanOffsetSpec
+
+    machine, context = test_machine_and_config
+    step = engrave_step_class.create(context, name="engrave")
+    step.bidir_x_offset_mm = 0.5
+    wp = WorkPiece(name="wp")
+    wp.set_size(10.0, 10.0)
+    doc = _make_doc(step, wp)
+
+    nodes = IntentBuilder(machine=machine).build(doc)
+    wpk = workpiece_key(wp.uid, step.uid)
+    wp_node = next(n for n in nodes if n.key == wpk)
+    payload = wp_node.stage.params
+
+    bidir_specs = [
+        s for s in payload.transformers if isinstance(s, BidirScanOffsetSpec)
+    ]
+    assert len(bidir_specs) == 1
+    assert bidir_specs[0].offset_mm == pytest.approx(0.5)
+
+
+def test_tabs_transformer_receives_step_configured_power(
+    contour_step_class, test_machine_and_config
+):
+    """Same regression as test_bidir_scan_offset_receives_step_configured_value,
+    for the other transformer that reads step-level settings:
+    TabsTransformer.to_spec() needs both tab_power and power (the
+    step's own power) from the settings dict, and would have silently
+    gotten 0.0/1.0 defaults from the same too-narrow settings dict."""
+    from raygeo.ops.transform.tabs import TabsSpec
+
+    machine, context = test_machine_and_config
+    step = contour_step_class.create(context, name="cut")
+    step.tab_power = 0.3
+    step.power = 0.8
+    wp = WorkPiece(name="wp")
+    wp.set_size(10.0, 10.0)
+    doc = _make_doc(step, wp)
+
+    nodes = IntentBuilder(machine=machine).build(doc)
+    wpk = workpiece_key(wp.uid, step.uid)
+    wp_node = next(n for n in nodes if n.key == wpk)
+    payload = wp_node.stage.params
+
+    tabs_specs = [s for s in payload.transformers if isinstance(s, TabsSpec)]
+    assert len(tabs_specs) == 1
+    assert tabs_specs[0].tab_power == pytest.approx(0.3)
+    assert tabs_specs[0].original_power == pytest.approx(0.8)
+
+
 def test_disabled_per_workpiece_transformer_not_wired(
     contour_step_class, test_machine_and_config
 ):

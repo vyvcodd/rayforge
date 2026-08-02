@@ -10,6 +10,7 @@ from .steps import (
     ContourStep,
     EngraveStep,
     FrameStep,
+    ImageEngraveStep,
     MaterialTestStep,
     ShrinkWrapStep,
     WavefrontStep,
@@ -24,6 +25,7 @@ def register_steps(step_registry):
     step_registry.register(ContourStep, addon_name=ADDON_NAME)
     step_registry.register(EngraveStep, addon_name=ADDON_NAME)
     step_registry.register(FrameStep, addon_name=ADDON_NAME)
+    step_registry.register(ImageEngraveStep, addon_name=ADDON_NAME)
     step_registry.register(MaterialTestStep, addon_name=ADDON_NAME)
     step_registry.register(ShrinkWrapStep, addon_name=ADDON_NAME)
     step_registry.register(WavefrontStep, addon_name=ADDON_NAME)

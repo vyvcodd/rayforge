@@ -98,7 +98,7 @@ class EngraveStep(LaserStep):
             )
 
         def uses_grayscale(v):
-            return is_power(v) or is_multi_pass(v)
+            return is_power(v) or is_multi_pass(v) or is_dither(v)
 
         def uses_levels(v):
             return uses_grayscale(v) or is_dither(v)
@@ -806,8 +806,20 @@ def _build_raster_part(
         return Part(size_mm=size), None
 
     spot_x, spot_y = LaserHead.get_spot_size(step.get_selected_laser(machine))
+    # Vertical render/dither resolution must track the *actual*
+    # resolved scan-line spacing (mirroring get_assembler_kwargs's
+    # resolution), not just the machine's physical spot height --
+    # otherwise the image is rendered at one row pitch while raygeo
+    # scans it at a different one, and each scan line just samples
+    # whichever row happens to be nearest, silently discarding
+    # whatever fell in between (harmless for a solid fill, but visible
+    # as aliased dark/light banding on detailed images once
+    # line_interval_mm diverges from the physical spot height).
+    line_interval_mm = (
+        step.line_interval_mm if step.line_interval_mm is not None else spot_y
+    )
     px_per_mm_x = 1.0 / (step.sample_interval_mm or spot_x / 2.0)
-    px_per_mm_y = 1.0 / spot_y
+    px_per_mm_y = 1.0 / line_interval_mm
 
     target_w = max(1, int(size[0] * px_per_mm_x))
     target_h = max(1, int(size[1] * px_per_mm_y))
@@ -837,6 +849,11 @@ def _build_raster_part(
             (px_per_mm_x, px_per_mm_y),
         )
 
+    dot_width = (
+        step.dot_width_correction_mm
+        if step.dot_width_correction_mm is not None
+        else spot_x / 2.0
+    )
     image, alpha = preprocess_raster_image(
         surface,
         mode=depth_mode,
@@ -852,6 +869,7 @@ def _build_raster_part(
         dither_serpentine=step.dither_serpentine,
         halftone_cell_mm=step.halftone_cell_mm,
         halftone_angle=step.halftone_angle,
+        dot_width_correction_mm=dot_width,
     )
     surface.flush()
     if image is None:

@@ -35,7 +35,8 @@ class StepSettingsDialog(PatchedDialogWindow):
         self.set_title(_("{name} Settings").format(name=step.name))
 
         # Adw.ToolbarView provides areas for a header, content, and bottom bar.
-        main_view = Adw.ToolbarView()
+        self._main_view = main_view = Adw.ToolbarView()
+        self._side_panel_paned: Gtk.Paned | None = None
         self.set_content(main_view)
 
         # A HeaderBar provides the window decorations (close button, etc.)
@@ -168,6 +169,36 @@ class StepSettingsDialog(PatchedDialogWindow):
     ):
         """Add an additional settings page tab."""
         self._extra_pages.append((title, page, icon_name))
+
+    def set_side_panel(self, widget: Gtk.Widget) -> None:
+        """Let a step-settings page contribute wide content (e.g. a
+        live preview) shown beside the tab stack, instead of squeezed
+        inside the narrow, fixed-width column Adw.PreferencesPage
+        clamps its rows to -- there's no supported way to widen that
+        clamp from a child widget, so content that genuinely needs
+        more room has to live outside it entirely.
+
+        A no-op default: nothing calls this, so every other step
+        type's dialog is laid out exactly as before. Only constructs
+        the side-by-side Paned the first time it's actually used.
+        """
+        if self._side_panel_paned is not None:
+            self._side_panel_paned.set_end_child(widget)
+            return
+        # self.stack is still parented to _main_view (set as its content
+        # in __init__) -- it must be unparented before Paned.set_start_child
+        # can take it, or GTK4 silently refuses the reparent.
+        self._main_view.set_content(None)
+        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        paned.set_start_child(self.stack)
+        paned.set_resize_start_child(True)
+        paned.set_shrink_start_child(True)
+        paned.set_end_child(widget)
+        paned.set_resize_end_child(True)
+        paned.set_shrink_end_child(True)
+        paned.set_position(560)
+        self._main_view.set_content(paned)
+        self._side_panel_paned = paned
 
     @classmethod
     def present_for_step(

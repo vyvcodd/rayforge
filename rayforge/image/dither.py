@@ -106,10 +106,18 @@ def grayscale_to_dithered_array(
     pixels_per_mm: tuple[float, float] = (1.0, 1.0),
 ) -> np.ndarray:
     """
-    Convert a grayscale array to a dithered binary array.
+    Dither an already-extracted grayscale array to binary.
+
+    Split out from surface_to_dithered_array() so callers that need to
+    normalize levels (auto-levels / black-white point) before dithering
+    -- e.g. preprocess_raster_image(), which otherwise dithers whatever
+    raw tonal range the source image happens to have, rather than the
+    full black-to-white range POWER_MODULATION/MULTI_PASS get via
+    _apply_raster_levels -- can do so without duplicating the surface
+    extraction step.
 
     Args:
-        grayscale: 2D uint8 grayscale array (0-255).
+        grayscale: uint8 grayscale array (0-255).
         dither_algorithm: The dithering algorithm to use.
         invert: If True, invert the output (engrave light areas).
         min_feature_px: Minimum feature size in pixels.
@@ -171,7 +179,6 @@ def surface_to_dithered_array(
     buf = np.frombuffer(surface.get_data(), dtype=np.uint8).copy()
 
     grayscale, _ = rgba_to_grayscale(buf, width, height, stride_px)
-
     return grayscale_to_dithered_array(
         grayscale, dither_algorithm, invert, min_feature_px
     )

@@ -1,0 +1,726 @@
+from __future__ import annotations
+
+from gettext import gettext as _
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Protocol,
+    cast,
+)
+
+import numpy as np
+from raygeo.cnc.execution.specs import ComputePayload
+from raygeo.ops.assembly import Assembler
+from raygeo.ops.assembly.raster import RasterSpec
+from raygeo.ops.part import Part
+from raygeo.ops.part.image_source import WholeImageSource
+
+from rayforge.core.capability import MachineCapability
+from rayforge.core.varset import (
+    AngleVar,
+    BoolVar,
+    IntVar,
+    LabeledChoiceVar,
+    LengthVar,
+    SliderFloatVar,
+    SliderIntVar,
+    VarSet,
+)
+from rayforge.image.dither import DitherAlgorithm
+from rayforge.machine.models.laser import LaserHead
+from rayforge.pipeline.stage.assembler_helpers import (
+    DepthMode,
+    compute_raster_auto_levels,
+    preprocess_raster_image,
+)
+from rayforge.pipeline.transformer.registry import transformer_registry
+
+from ..levels_range_var import LevelsRangeVar
+from ..scan_angle_var import ScanAngleVar
+from .laser_step import LaserStep
+
+if TYPE_CHECKING:
+    from rayforge.context import RayforgeContext
+    from rayforge.core.workpiece import WorkPiece
+    from rayforge.machine.models.machine import Machine
+
+    class OverscanTransformerType(Protocol):
+        @staticmethod
+        def calculate_auto_distance(
+            step_speed: int, max_acceleration: int
+        ) -> float: ...
+
+
+class ImageEngraveStep(LaserStep):
+    """PoC: split out of EngraveStep (raster_step.py) as an independent
+    copy rather than a subclass, per PLAN_burn_preview.md's follow-up
+    scope -- a dedicated step for image-sourced raster engraving, so
+    its settings widget can carry the live burn preview and more
+    advanced controls without crowding the general-purpose Engrave
+    step's UI. Assess at the end whether this should be merged back
+    into EngraveStep or kept independent, once real divergence (or
+    lack thereof) shows up.
+    """
+
+    TYPELABEL = _("Image Engrave")
+    ICON = "step-raster-symbolic"
+    REQUIRED_MACHINE_CAPS = frozenset({MachineCapability.LASER})
+    ASSEMBLER_NAME = "image_engrave"
+
+    line_interval_mm: float | None
+    sample_interval_mm: float | None
+    dot_width_correction_mm: float | None
+
+    def __init__(
+        self, name: str | None = None, typelabel: str | None = None
+    ):
+        super().__init__(typelabel=typelabel or self.TYPELABEL, name=name)
+        self.scan_angle = 0.0
+        self.depth_mode = "POWER_MODULATION"
+        self.invert = False
+        self.auto_levels = True
+        self.black_point = 0
+        self.white_point = 255
+        self.threshold = 128
+        self.line_interval_mm = None
+        self.sample_interval_mm = None
+        self.dot_width_correction_mm = None
+        self.min_power_level = 0.0
+        self.max_power_level = 1.0
+        self.num_power_levels = 25
+        self.offset_x_mm = 0.0
+        self.offset_y_mm = 0.0
+        self.scan_mode = "SEGMENTED"
+        self.cross_hatch = False
+        self.num_depth_levels = 5
+        self.z_step_down = 0.0
+        self.angle_increment = 0.0
+        self.dither_algorithm = None
+        self.bidir_x_offset_mm = 0.0
+
+    @classmethod
+    def recipe_varset(cls) -> VarSet:
+        def is_power(v):
+            return v.get("depth_mode") == "POWER_MODULATION"
+
+        def is_constant(v):
+            return v.get("depth_mode") == "CONSTANT_POWER"
+
+        def is_dither(v):
+            return v.get("depth_mode") == "DITHER"
+
+        def is_multi_pass(v):
+            return v.get("depth_mode") == "MULTI_PASS"
+
+        def uses_grayscale(v):
+            return is_power(v) or is_multi_pass(v) or is_dither(v)
+
+        return VarSet(
+            vars=[
+                *LaserStep.recipe_varset().vars,
+                LabeledChoiceVar(
+                    key="depth_mode",
+                    label=_("Mode"),
+                    choices=[(m.display_name, m.name) for m in DepthMode],
+                    default="POWER_MODULATION",
+                    allow_none=False,
+                ),
+                SliderIntVar(
+                    key="threshold",
+                    label=_("Threshold"),
+                    description=_(
+                        "Brightness cutoff for black/white (0-255)"
+                    ),
+                    default=128,
+                    min_val=0,
+                    max_val=255,
+                    visible_when=is_constant,
+                ),
+                LabeledChoiceVar(
+                    key="dither_algorithm",
+                    label=_("Engraving Method"),
+                    description=_(
+                        "Algorithm for converting grayscale to binary"
+                    ),
+                    choices=[
+                        (m.display_name, m.name) for m in DitherAlgorithm
+                    ],
+                    default="FLOYD_STEINBERG",
+                    visible_when=is_dither,
+                    allow_none=False,
+                ),
+                ScanAngleVar(),
+                BoolVar(
+                    key="cross_hatch",
+                    label=_("Cross-Hatch"),
+                    description=_("Add a second pass at 90 degrees"),
+                    default=False,
+                ),
+                LabeledChoiceVar(
+                    key="scan_mode",
+                    label=_("Scan Mode"),
+                    choices=[
+                        (_("Segmented"), "SEGMENTED"),
+                        (_("Full Sweep"), "FULL_SWEEP"),
+                    ],
+                    default="SEGMENTED",
+                    description=_(
+                        "Segmented: moves between content regions. "
+                        "Full Sweep: scans full width with laser "
+                        "toggling"
+                    ),
+                    allow_none=False,
+                ),
+                LengthVar(
+                    key="line_interval_mm",
+                    label=_("Line Spacing"),
+                    description=_("Distance between scan lines"),
+                    default=0.0,
+                    min_val=0.0,
+                    digits=3,
+                ),
+                LengthVar(
+                    key="sample_interval_mm",
+                    label=_("Sample Interval"),
+                    description=_(
+                        "Distance between power samples along scan "
+                        "line. Lower values improve accuracy, but "
+                        "increase output size"
+                    ),
+                    default=0.0,
+                    min_val=0.0,
+                    visible_when=is_power,
+                    digits=3,
+                ),
+                LengthVar(
+                    key="dot_width_correction_mm",
+                    label=_("Dot Width Correction"),
+                    description=_(
+                        "Reduces engrave length at both ends to "
+                        "compensate for physical dot width"
+                    ),
+                    default=0.0,
+                    min_val=0.0,
+                    digits=3,
+                ),
+                LengthVar(
+                    key="bidir_x_offset_mm",
+                    label=_("Bidirectional Scan Offset"),
+                    description=_(
+                        "Corrects X misalignment between left-to-"
+                        "right and right-to-left raster passes"
+                    ),
+                    default=0.0,
+                    min_val=-5.0,
+                    max_val=5.0,
+                    digits=3,
+                ),
+                BoolVar(
+                    key="invert",
+                    label=_("Invert"),
+                    description=_(
+                        "Engrave white areas instead of black areas"
+                    ),
+                    default=False,
+                ),
+                IntVar(
+                    key="num_depth_levels",
+                    label=_("Number of Depth Levels"),
+                    default=5,
+                    min_val=1,
+                    max_val=255,
+                    visible_when=is_multi_pass,
+                ),
+                LengthVar(
+                    key="z_step_down",
+                    label=_("Z Step-Down per Level"),
+                    default=0.0,
+                    min_val=0.0,
+                    max_val=50.0,
+                    visible_when=is_multi_pass,
+                ),
+                AngleVar(
+                    key="angle_increment",
+                    label=_("Rotate Angle Per Pass"),
+                    description=_("Degrees to rotate each successive pass"),
+                    default=0.0,
+                    min_val=0.0,
+                    max_val=180.0,
+                    visible_when=is_multi_pass,
+                ),
+                BoolVar(
+                    key="auto_levels",
+                    label=_("Auto Levels"),
+                    description=_(
+                        "Automatically adjust black/white points"
+                    ),
+                    default=True,
+                    visible_when=uses_grayscale,
+                ),
+                LevelsRangeVar(
+                    visible_when=uses_grayscale,
+                ),
+                IntVar(
+                    key="white_point",
+                    label=_("White Point"),
+                    default=255,
+                    min_val=0,
+                    max_val=255,
+                    visible_when=uses_grayscale,
+                ),
+                SliderFloatVar(
+                    key="min_power_level",
+                    label=_("Min Power"),
+                    description=_(
+                        "Power for lightest areas, as a percentage of "
+                        "the step's main power"
+                    ),
+                    default=0.0,
+                    min_val=0.0,
+                    max_val=1.0,
+                    show_value=True,
+                    format_suffix="%",
+                    visible_when=is_power,
+                ),
+                SliderFloatVar(
+                    key="max_power_level",
+                    label=_("Max Power"),
+                    description=_(
+                        "Power for darkest areas, as a percentage of "
+                        "the step's main power"
+                    ),
+                    default=1.0,
+                    min_val=0.0,
+                    max_val=1.0,
+                    show_value=True,
+                    format_suffix="%",
+                    visible_when=is_power,
+                ),
+                IntVar(
+                    key="num_power_levels",
+                    label=_("Power Levels"),
+                    description=_(
+                        "Number of discrete power steps (lower = fewer "
+                        "moves)"
+                    ),
+                    default=25,
+                    min_val=2,
+                    max_val=256,
+                    visible_when=is_power,
+                ),
+            ]
+        )
+
+    @classmethod
+    def recipe_value(cls, key: str, value: Any) -> Any:
+        """Serialize enum-backed attributes for recipe storage."""
+        result = super().recipe_value(key, value)
+        if key == "dither_algorithm" and isinstance(value, DitherAlgorithm):
+            return value.name
+        return result
+
+    def set_dither_algorithm(
+        self, algorithm: DitherAlgorithm | str | None
+    ):
+        """Sets the dither algorithm, accepting the enum or its name
+        (as stored in varsets and recipes). ``None`` means auto."""
+        if isinstance(algorithm, str):
+            algorithm = DitherAlgorithm[algorithm] if algorithm else None
+        if self.dither_algorithm != algorithm:
+            self.dither_algorithm = algorithm
+            self.updated.send(self)
+
+    def get_operation_mode_short(self):
+        if not self.depth_mode:
+            return None
+        try:
+            return DepthMode[self.depth_mode].short_name
+        except KeyError:
+            return None
+
+    def is_position_sensitive(self) -> bool:
+        """The raster assembler bakes ``workpiece.bbox`` into its
+        output via ``offset_x_mm`` / ``offset_y_mm`` so the compute
+        result depends on the workpiece's absolute world position
+        (not just on per-workpiece transformers like CropTransformer).
+        Returning True ensures the compute token folds in
+        ``transform_revision`` so a pure move invalidates the
+        workpiece compute cache rather than leaving stale,
+        wrong-position ops to be re-displaced by the aggregate's new
+        placement matrix."""
+        return True
+
+    def get_assembler_kwargs(
+        self,
+        machine: Machine,
+        workpiece: WorkPiece,
+    ) -> dict:
+        _spot_x, spot_y = LaserHead.get_spot_size(
+            self.get_selected_laser(machine)
+        )
+        line_interval = (
+            self.line_interval_mm
+            if self.line_interval_mm is not None
+            else spot_y
+        )
+        return {
+            "mode": DepthMode[self.depth_mode].raygeo_name,
+            "line_interval_mm": line_interval,
+            "sample_interval_mm": self.sample_interval_mm,
+            "dot_width_correction_mm": self.dot_width_correction_mm,
+            "min_power": self.min_power_level,
+            "max_power": self.max_power_level,
+            "step_power": self.power,
+            "num_power_levels": self.num_power_levels,
+            "angle": self.scan_angle,
+            "offset_x_mm": self.offset_x_mm,
+            "offset_y_mm": self.offset_y_mm,
+            "scan_mode": self.scan_mode.lower(),
+            "cross_hatch": self.cross_hatch,
+            "num_depth_levels": self.num_depth_levels,
+            "z_step_down": self.z_step_down,
+            "angle_increment": self.angle_increment,
+        }
+
+    def build_compute_payload(
+        self,
+        machine: Machine,
+        workpiece: WorkPiece,
+    ) -> tuple[Part, ComputePayload]:
+        """Build a :class:`Part` with the preprocessed raster image
+        attached as a :class:`WholeImageSource`, and a
+        :class:`ComputePayload` carrying a :class:`RasterSpec`.
+
+        Rendering and preprocessing (dither / auto-levels / depth
+        mode) happen here, on the calling thread, so the Rust
+        assembler on the rayon worker only reads slabs from the
+        attached image source.
+        """
+        spot_x, spot_y = LaserHead.get_spot_size(
+            self.get_selected_laser(machine)
+        )
+        part, alpha = _build_raster_part(self, machine, workpiece)
+        kwargs = self.get_assembler_kwargs(machine, workpiece)
+        depth_mode = DepthMode[self.depth_mode]
+        line_interval = kwargs["line_interval_mm"] or spot_y
+        sample_interval = kwargs["sample_interval_mm"] or spot_x / 2.0
+        dot_width = (
+            kwargs["dot_width_correction_mm"]
+            if kwargs["dot_width_correction_mm"] is not None
+            else spot_x / 2.0
+        )
+        x_off, y_off, _w, _h = workpiece.bbox
+        alpha_arr = (
+            (alpha * 255).astype(np.uint8).tobytes()
+            if alpha is not None
+            else None
+        )
+        spec = RasterSpec(
+            mode=depth_mode.raygeo_name,
+            line_interval_mm=line_interval,
+            sample_interval_mm=sample_interval,
+            min_power=kwargs["min_power"],
+            max_power=kwargs["max_power"],
+            step_power=kwargs["step_power"],
+            num_power_levels=kwargs["num_power_levels"],
+            angle=kwargs["angle"],
+            offset_x_mm=x_off,
+            offset_y_mm=y_off,
+            scan_mode=kwargs["scan_mode"],
+            cross_hatch=kwargs["cross_hatch"],
+            num_depth_levels=kwargs["num_depth_levels"],
+            z_step_down=kwargs["z_step_down"],
+            angle_increment=kwargs["angle_increment"],
+            dot_width_correction_mm=dot_width,
+            alpha=alpha_arr,
+        )
+        return part, ComputePayload(assembler=Assembler(spec))
+
+    def assembler_token_params(
+        self,
+        machine: Machine,
+        workpiece: WorkPiece,
+    ) -> dict | None:
+        return self.get_assembler_kwargs(machine, workpiece)
+
+    def get_cache_params(self) -> dict:
+        """Cache params must cover the raster image preprocessing.
+
+        The preprocessed image (levels, inversion, threshold, dither)
+        is baked into the :class:`Part` the assembler consumes, so any
+        of these settings changing must invalidate the workpiece
+        compute cache even though the assembler spec itself is
+        unchanged.
+        """
+        params = super().get_cache_params()
+        params.update(
+            {
+                "invert": self.invert,
+                "auto_levels": self.auto_levels,
+                "black_point": self.black_point,
+                "white_point": self.white_point,
+                "threshold": self.threshold,
+                "dither_algorithm": (
+                    self.dither_algorithm.name
+                    if self.dither_algorithm is not None
+                    else None
+                ),
+            }
+        )
+        return params
+
+    def to_dict(self) -> dict:
+        result = super().to_dict()
+        result["scan_angle"] = self.scan_angle
+        result["depth_mode"] = self.depth_mode
+        result["invert"] = self.invert
+        result["auto_levels"] = self.auto_levels
+        result["black_point"] = self.black_point
+        result["white_point"] = self.white_point
+        result["threshold"] = self.threshold
+        result["line_interval_mm"] = self.line_interval_mm
+        result["sample_interval_mm"] = self.sample_interval_mm
+        result["dot_width_correction_mm"] = self.dot_width_correction_mm
+        result["min_power_level"] = self.min_power_level
+        result["max_power_level"] = self.max_power_level
+        result["num_power_levels"] = self.num_power_levels
+        result["offset_x_mm"] = self.offset_x_mm
+        result["offset_y_mm"] = self.offset_y_mm
+        result["scan_mode"] = self.scan_mode
+        result["cross_hatch"] = self.cross_hatch
+        result["num_depth_levels"] = self.num_depth_levels
+        result["z_step_down"] = self.z_step_down
+        result["angle_increment"] = self.angle_increment
+        result["dither_algorithm"] = (
+            self.dither_algorithm.value if self.dither_algorithm else None
+        )
+        result["bidir_x_offset_mm"] = self.bidir_x_offset_mm
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ImageEngraveStep:
+        step = cast("ImageEngraveStep", super().from_dict(data))
+        step.scan_angle = data.get("scan_angle", 0.0)
+        step.depth_mode = data.get("depth_mode", "POWER_MODULATION")
+        step.invert = data.get("invert", False)
+        step.auto_levels = data.get("auto_levels", True)
+        step.black_point = data.get("black_point", 0)
+        step.white_point = data.get("white_point", 255)
+        step.threshold = data.get("threshold", 128)
+        step.line_interval_mm = data.get("line_interval_mm", None)
+        step.sample_interval_mm = data.get("sample_interval_mm", None)
+        step.dot_width_correction_mm = data.get(
+            "dot_width_correction_mm", None
+        )
+        step.min_power_level = data.get("min_power_level", 0.0)
+        step.max_power_level = data.get("max_power_level", 1.0)
+        step.num_power_levels = int(data.get("num_power_levels", 25))
+        step.offset_x_mm = data.get("offset_x_mm", 0.0)
+        step.offset_y_mm = data.get("offset_y_mm", 0.0)
+        step.scan_mode = data.get("scan_mode", "SEGMENTED")
+        step.cross_hatch = data.get("cross_hatch", False)
+        step.num_depth_levels = int(data.get("num_depth_levels", 5))
+        step.z_step_down = data.get("z_step_down", 0.0)
+        step.angle_increment = data.get("angle_increment", 0.0)
+        dither_val = data.get("dither_algorithm")
+        if dither_val is not None:
+            try:
+                step.dither_algorithm = DitherAlgorithm(dither_val)
+            except ValueError:
+                step.dither_algorithm = DitherAlgorithm.FLOYD_STEINBERG
+        step.bidir_x_offset_mm = data.get("bidir_x_offset_mm", 0.0)
+        return step
+
+    @classmethod
+    def _serialized_keys(cls) -> frozenset[str]:
+        return super()._serialized_keys() | frozenset(
+            {
+                "scan_angle",
+                "depth_mode",
+                "invert",
+                "auto_levels",
+                "black_point",
+                "white_point",
+                "threshold",
+                "line_interval_mm",
+                "sample_interval_mm",
+                "dot_width_correction_mm",
+                "min_power_level",
+                "max_power_level",
+                "num_power_levels",
+                "offset_x_mm",
+                "offset_y_mm",
+                "scan_mode",
+                "cross_hatch",
+                "num_depth_levels",
+                "z_step_down",
+                "angle_increment",
+                "dither_algorithm",
+                "bidir_x_offset_mm",
+            }
+        )
+
+    @classmethod
+    def get_default_transformers_dicts(cls) -> tuple[list, list]:
+        OverscanTransformer = transformer_registry.get("OverscanTransformer")
+        Optimize = transformer_registry.get("Optimize")
+        MultiPassTransformer = transformer_registry.get(
+            "MultiPassTransformer"
+        )
+        BidirScanOffsetTransformer = transformer_registry.get(
+            "BidirScanOffsetTransformer"
+        )
+        assert OverscanTransformer is not None
+        assert Optimize is not None
+        assert MultiPassTransformer is not None
+        assert BidirScanOffsetTransformer is not None
+        optimize_dict = Optimize().to_dict()
+        return [
+            OverscanTransformer(
+                enabled=True, distance_mm=0, auto=True
+            ).to_dict(),
+            optimize_dict,
+            BidirScanOffsetTransformer(enabled=True).to_dict(),
+        ], [
+            optimize_dict,
+            MultiPassTransformer(passes=1, z_step_down=0.0).to_dict(),
+        ]
+
+    @classmethod
+    def create(
+        cls,
+        context: RayforgeContext,
+        name: str | None = None,
+        **kwargs,
+    ) -> ImageEngraveStep:
+        machine = context.machine
+        assert machine is not None
+        default_head = machine.get_default_laser_head()
+        if default_head is None:
+            raise ValueError("Machine has no laser heads configured.")
+
+        step = cls(name=name)
+        per_wp, per_step = cls.get_default_transformers_dicts()
+
+        step.per_workpiece_transformers_dicts = per_wp
+        step.per_step_transformers_dicts = per_step
+        step.selected_head_uid = default_head.uid
+        step.max_cut_speed = machine.max_cut_speed
+        step.max_travel_speed = machine.max_travel_speed
+        step.cut_speed = min(machine.max_cut_speed, 4000)
+        params = machine.get_pwm_params(default_head)
+        if params is not None:
+            step.frequency = params.frequency
+            step.pulse_width = params.pulse_width
+
+        OverscanTransformer = cast(
+            "OverscanTransformerType",
+            transformer_registry.get("OverscanTransformer"),
+        )
+        assert OverscanTransformer is not None
+        auto_distance = OverscanTransformer.calculate_auto_distance(
+            step.cut_speed, machine.acceleration
+        )
+        for t in per_wp:
+            if t.get("name") == "OverscanTransformer":
+                t["distance_mm"] = auto_distance
+
+        return step
+
+
+def _build_raster_part(
+    step: ImageEngraveStep,
+    machine: Machine,
+    workpiece: WorkPiece,
+) -> tuple[Part, np.ndarray | None]:
+    """Render and preprocess the workpiece into a :class:`Part`
+    carrying a :class:`WholeImageSource`, and return the alpha
+    channel separately so the caller can fold it into the
+    :class:`RasterSpec`.
+
+    The rendering resolution is clamped to
+    :data:`MAX_RASTER_RENDER_PIXELS` to bound memory.  Auto-levels
+    are precomputed here (see target-architecture.md B3.3) so all
+    slabs see consistent black/white points.
+    """
+    size = workpiece.size
+    if size[0] <= 0 or size[1] <= 0:
+        return Part(size_mm=size), None
+
+    spot_x, spot_y = LaserHead.get_spot_size(step.get_selected_laser(machine))
+    # Vertical render/dither resolution must track the *actual*
+    # resolved scan-line spacing (mirroring get_assembler_kwargs's
+    # resolution), not just the machine's physical spot height --
+    # otherwise the image is rendered at one row pitch while raygeo
+    # scans it at a different one, and each scan line just samples
+    # whichever row happens to be nearest, silently discarding
+    # whatever fell in between (harmless for a solid fill, but visible
+    # as aliased dark/light banding on detailed images once
+    # line_interval_mm diverges from the physical spot height).
+    line_interval_mm = (
+        step.line_interval_mm if step.line_interval_mm is not None else spot_y
+    )
+    px_per_mm_x = 1.0 / (step.sample_interval_mm or spot_x / 2.0)
+    px_per_mm_y = 1.0 / line_interval_mm
+
+    target_w = max(1, int(size[0] * px_per_mm_x))
+    target_h = max(1, int(size[1] * px_per_mm_y))
+    num_pixels = target_w * target_h
+    if num_pixels > MAX_RASTER_RENDER_PIXELS:
+        scale = (MAX_RASTER_RENDER_PIXELS / num_pixels) ** 0.5
+        target_w = max(1, int(target_w * scale))
+        target_h = max(1, int(target_h * scale))
+
+    # Recompute pixels-per-mm from the actual integer target dimensions so
+    # that the rendered image pixels exactly cover the workpiece size.
+    # Without this, the int() truncation above leaves the image slightly
+    # smaller than size_mm, shrinking the raster by up to one pixel.
+    px_per_mm_x = target_w / size[0]
+    px_per_mm_y = target_h / size[1]
+
+    surface = workpiece.render_to_pixels(target_w, target_h)
+    if surface is None:
+        return Part(size_mm=size), None
+
+    depth_mode = DepthMode[step.depth_mode]
+
+    computed_auto_levels = None
+    if step.auto_levels:
+        computed_auto_levels = compute_raster_auto_levels(
+            workpiece,
+            (px_per_mm_x, px_per_mm_y),
+            invert=step.invert,
+        )
+
+    dot_width = (
+        step.dot_width_correction_mm
+        if step.dot_width_correction_mm is not None
+        else spot_x / 2.0
+    )
+    image, alpha = preprocess_raster_image(
+        surface,
+        mode=depth_mode,
+        invert=step.invert,
+        auto_levels=step.auto_levels,
+        computed_auto_levels=computed_auto_levels,
+        black_point=step.black_point,
+        white_point=step.white_point,
+        threshold=step.threshold,
+        dither_algorithm=step.dither_algorithm,
+        laser_spot_x_mm=spot_x,
+        pixels_per_mm_x=px_per_mm_x,
+        dot_width_correction_mm=dot_width,
+    )
+    surface.flush()
+    if image is None:
+        return Part(size_mm=size), None
+
+    part = Part(
+        size_mm=size,
+        pixels_per_mm=(px_per_mm_x, px_per_mm_y),
+    )
+    part.image_source = WholeImageSource(image)
+    return part, alpha
+
+
+MAX_RASTER_RENDER_PIXELS = 16 * 1024 * 1024

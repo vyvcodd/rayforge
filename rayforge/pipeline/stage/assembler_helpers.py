@@ -224,6 +224,14 @@ def build_part_vector(
 
 MAX_VECTOR_TRACE_PIXELS = 16 * 1024 * 1024
 
+# Dithering's minimum-feature floor must clear apply_dot_width_trim's
+# deletion threshold (2 * dot_width_correction_mm) with room to spare --
+# sizing it at exactly that threshold means many runs (it's a hard
+# floor, so lots land right on it) sit exactly on trim's "delete
+# outright" boundary instead of surviving with something left to
+# gracefully shrink. This margin (in samples, not mm) is that room.
+_DOT_WIDTH_TRIM_MARGIN_PX = 2
+
 
 def build_part_vector_with_raster_fallback(
     workpiece: WorkPiece,
@@ -304,6 +312,7 @@ def preprocess_raster_image(
     dither_serpentine: bool = False,
     halftone_cell_mm: float = DEFAULT_HALFTONE_CELL_MM,
     halftone_angle: float = DEFAULT_HALFTONE_ANGLE,
+    dot_width_correction_mm: float | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Convert a Cairo surface into an image array for a raster assembler.
 
@@ -339,6 +348,17 @@ def preprocess_raster_image(
             the error-diffusion algorithms.
         halftone_cell_mm: Dot spacing of the halftone screen in mm.
         halftone_angle: Halftone screen angle in degrees.
+        dot_width_correction_mm: The dot-width correction the raster
+            assembler will apply downstream (Rust-side
+            ``apply_dot_width_trim``, which deletes an entire dithered
+            run outright once its length drops to ``2 *
+            dot_width_correction_mm`` or below, rather than shrinking
+            it gracefully). Folded into the dither minimum-feature-size
+            floor below, with margin (see ``_DOT_WIDTH_TRIM_MARGIN_PX``),
+            so every run dithering produces clears trim's deletion
+            boundary and only ever gets its edges shrunk, never deleted
+            outright. ``None``/``0`` leaves the floor at just the
+            physical spot size, as before.
 
     Returns:
         ``(image, alpha)`` where *image* is a 2-D ``uint8`` array
@@ -359,10 +379,23 @@ def preprocess_raster_image(
         return gray_image, alpha
 
     if mode == DepthMode.DITHER:
-        min_feature_px = max(
-            1,
-            round(laser_spot_x_mm * pixels_per_mm_x),
-        )
+        # A dithered run only survives apply_dot_width_trim if it's
+        # longer than 2 * dot_width_correction_mm (shorter runs are
+        # deleted outright, not shrunk -- see raygeo's
+        # apply_dot_width_trim). Fold that into the minimum feature
+        # size dithering itself respects, with margin (see
+        # _DOT_WIDTH_TRIM_MARGIN_PX), so a run that clears dithering's
+        # floor also clears trim's deletion boundary -- trim then only
+        # ever shrinks a surviving run's edges, never deletes it
+        # outright.
+        spot_min_px = int(round(laser_spot_x_mm * pixels_per_mm_x))
+        dot_width_min_px = 0
+        if dot_width_correction_mm:
+            dot_width_min_px = (
+                int(round(2 * dot_width_correction_mm * pixels_per_mm_x))
+                + _DOT_WIDTH_TRIM_MARGIN_PX
+            )
+        min_feature_px = max(1, spot_min_px, dot_width_min_px)
         algo = dither_algorithm or DitherAlgorithm.FLOYD_STEINBERG
         gray_image, alpha = surface_to_grayscale(surface)
         gray_image = _apply_raster_levels(

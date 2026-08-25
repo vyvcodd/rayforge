@@ -4,7 +4,7 @@ from gettext import gettext as _
 from typing import Any
 
 import numpy as np
-from gi.repository import Adw
+from gi.repository import Adw, Gtk
 from raygeo.image.grayscale import compute_auto_levels
 
 from rayforge.core.varset import Var
@@ -58,6 +58,7 @@ class LevelsAdapter(RowAdapter):
         self._row = row
         self.preview = preview
         self._step: Any = None
+        self._subtitle_label: Gtk.Label | None = None
         preview.black_point_changed.connect(
             lambda s, **kw: self.changed.send(self),
             weak=False,
@@ -83,6 +84,30 @@ class LevelsAdapter(RowAdapter):
         adapter = cls(row, preview)
         adapter._update_subtitle()
         return row, adapter
+
+    def detach_preview(self) -> HistogramPreview:
+        """Remove the histogram preview from its row's suffix and
+        return it, so a host page can mount it elsewhere (e.g. a wide
+        side panel under a bigger preview) instead of inline in the
+        settings list. The row itself stays registered with the
+        varset widget -- black_point/white_point still flow through
+        this adapter as normal -- but the caller is expected to keep
+        the row hidden (e.g. via the var's ``visible_when``) since it
+        no longer has any visible content of its own.
+        """
+        self._row.remove(self.preview)
+        return self.preview
+
+    def set_subtitle_label(self, label: Gtk.Label | None) -> None:
+        """Mirror the row's subtitle hint text onto an external label.
+
+        Used together with :meth:`detach_preview`: once the preview
+        moves out of the row, the "auto-adjusted" / "drag markers"
+        hint has nowhere left to show, so the host page can supply a
+        label here instead.
+        """
+        self._subtitle_label = label
+        self._update_subtitle()
 
     def set_histogram_source(self, step: Any) -> None:
         """Point the adapter at the step whose layer supplies the
@@ -183,10 +208,9 @@ class LevelsAdapter(RowAdapter):
 
     def _update_subtitle(self):
         if self.preview.auto_mode:
-            self._row.set_subtitle(
-                escape_title(_("Auto-adjusted based on image content"))
-            )
+            text = _("Auto-adjusted based on image content")
         else:
-            self._row.set_subtitle(
-                escape_title(_("Drag markers to set black/white points"))
-            )
+            text = _("Drag markers to set black/white points")
+        self._row.set_subtitle(escape_title(text))
+        if self._subtitle_label is not None:
+            self._subtitle_label.set_label(text)

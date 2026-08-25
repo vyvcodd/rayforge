@@ -17,6 +17,7 @@ from typing import (
 )
 
 import numpy as np
+import pyvips
 from raygeo.geo import Geometry, Matrix
 from raygeo.image.grayscale import (
     compute_auto_levels,
@@ -34,6 +35,7 @@ from ...image.dither import (
 )
 from ...image.tracing import trace_surface
 from ...image.util.grayscale import surface_to_binary, surface_to_grayscale
+from ...image.util.vips import normalize_to_rgba
 
 if TYPE_CHECKING:
     import cairo
@@ -304,6 +306,7 @@ def preprocess_raster_image(
     computed_auto_levels: tuple[int, int] | None = None,
     black_point: int = 0,
     white_point: int = 255,
+    curve_points: list[tuple[float, float]] | None = None,
     threshold: int = 128,
     dither_algorithm: DitherAlgorithm | None = None,
     laser_spot_x_mm: float = 0.1,
@@ -334,6 +337,11 @@ def preprocess_raster_image(
             ``auto_levels`` is False.
         white_point: Manual white-point (0–255) when
             ``auto_levels`` is False.
+        curve_points: Piecewise-linear (input, output) control points
+            in 0..1, applied as a midtone curve after the black/white
+            levels stretch without moving the black or white points.
+            ``None``/the two-point identity ``[(0, 0), (1, 1)]``
+            means no correction.
         threshold: Brightness threshold (0–255) for binary
             ``CONSTANT_POWER`` mode.
         dither_algorithm: Dithering algorithm for ``DITHER`` mode.
@@ -375,6 +383,7 @@ def preprocess_raster_image(
             computed_auto_levels=computed_auto_levels,
             black_point=black_point,
             white_point=white_point,
+            curve_points=curve_points,
         )
         return gray_image, alpha
 
@@ -405,6 +414,7 @@ def preprocess_raster_image(
             computed_auto_levels=computed_auto_levels,
             black_point=black_point,
             white_point=white_point,
+            curve_points=curve_points,
         )
         image = grayscale_to_dithered_array(
             gray_image,
@@ -427,6 +437,104 @@ def preprocess_raster_image(
     return None, None
 
 
+def preprocess_raster_image_vips(
+    vips_image: "pyvips.Image",
+    *,
+    mode: DepthMode,
+    invert: bool = False,
+    auto_levels: bool = True,
+    computed_auto_levels: tuple[int, int] | None = None,
+    black_point: int = 0,
+    white_point: int = 255,
+    curve_points: list[tuple[float, float]] | None = None,
+    threshold: int = 128,
+) -> tuple["pyvips.Image", "pyvips.Image | None"]:
+    """Streaming equivalent of :func:`preprocess_raster_image` for the
+    modes that carry no cross-pixel state (everything except
+    ``DITHER`` -- Floyd-Steinberg's error diffusion has no chunked
+    implementation available, see :func:`_build_raster_part`'s
+    docstring).
+
+    Builds the result as a graph of lazy vips operations instead of a
+    fully-materialized numpy array, so it scales to a workpiece of any
+    size without :data:`MAX_RASTER_RENDER_PIXELS`: the caller wraps
+    the returned image in a ``VipsChunkSource``, which raygeo reads
+    back in horizontal slabs on demand rather than requiring one
+    giant buffer up front.
+
+    ``auto_levels=True`` requires ``computed_auto_levels`` -- unlike
+    :func:`preprocess_raster_image`, this has no fallback that
+    computes levels from the (potentially huge) full image; callers
+    always have a small-preview auto-levels result available (see
+    ``compute_raster_auto_levels``) since that's already how the
+    existing capped path keeps levels consistent across chunks.
+
+    Returns ``(image, alpha)`` where *image* is a single-band uchar
+    vips image (grayscale for MULTI_PASS/POWER_MODULATION, binary
+    0/1 for CONSTANT_POWER) and *alpha* is a single-band uchar vips
+    image, or ``None`` when the source has no real transparency --
+    skipping alpha avoids materializing a same-size second buffer for
+    the common case of a fully-opaque workpiece.
+    """
+    rgba = normalize_to_rgba(vips_image)
+    if rgba is None:
+        raise ValueError("Failed to normalize vips image to RGBA")
+
+    alpha_band = rgba[3]
+    # A global stat, not a materialize: vips computes this by streaming
+    # through the pipeline without ever holding the full image at once.
+    has_transparency = bool(alpha_band.min() < 255)
+    alpha = alpha_band if has_transparency else None
+
+    gray = rgba[0:3].colourspace("b-w")
+
+    if mode == DepthMode.CONSTANT_POWER:
+        # Matches raygeo's rgba_to_binary: burn (1) when strictly past
+        # threshold on the appropriate side; the threshold value itself
+        # never burns, in either direction. vips relational ops yield
+        # 0/255, not 0/1 -- ifthenelse maps that to the 0/1 convention
+        # the assembler expects (a bare cast would keep 0/255).
+        mask = gray > threshold if invert else gray < threshold
+        image = mask.ifthenelse(1, 0).cast("uchar")
+        return image, alpha
+
+    # MULTI_PASS / POWER_MODULATION.
+    if invert:
+        gray = 255 - gray
+
+    if auto_levels:
+        if computed_auto_levels is None:
+            raise ValueError(
+                "preprocess_raster_image_vips requires "
+                "computed_auto_levels when auto_levels=True"
+            )
+        bp, wp = computed_auto_levels
+    else:
+        bp, wp = black_point, white_point
+
+    if bp > 0 or wp < 255:
+        # round-then-cast, not a bare truncating cast, to track
+        # normalize_grayscale's rounding (still within +/-1 of it at
+        # a handful of exact half-integer boundaries -- an
+        # imperceptible ~0.4% power difference, not worth chasing
+        # bit-exactness against an undocumented internal rounding
+        # mode in a separate compiled dependency).
+        scale = 255.0 / max(wp - bp, 1)
+        offset = -bp * scale
+        gray = gray.linear(scale, offset).round("rint").cast("uchar")
+
+    if curve_points and curve_points != [(0.0, 0.0), (1.0, 1.0)]:
+        # Midtone curve after the levels stretch, as a LUT applied via
+        # vips's own maplut op -- matches the numpy path's
+        # _curve_to_lut()/fancy-indexing exactly, just via vips's
+        # native LUT machinery instead of a Python array index.
+        lut_arr = _curve_to_lut(curve_points)
+        lut_img = pyvips.Image.new_from_array([list(lut_arr)])
+        gray = gray.maplut(lut_img).cast("uchar")
+
+    return gray, alpha
+
+
 def _apply_raster_levels(
     gray_image: np.ndarray,
     alpha: np.ndarray,
@@ -435,8 +543,10 @@ def _apply_raster_levels(
     computed_auto_levels: tuple[int, int] | None = None,
     black_point: int = 0,
     white_point: int = 255,
+    curve_points: list[tuple[float, float]] | None = None,
 ) -> np.ndarray:
-    """Apply auto-levels or manual black/white-point normalization.
+    """Apply auto-levels or manual black/white-point normalization,
+    then a midtone curve.
 
     This is the standalone equivalent of ``Rasterizer._apply_levels``.
     """
@@ -450,7 +560,24 @@ def _apply_raster_levels(
 
     if bp > 0 or wp < 255:
         gray_image = normalize_grayscale(gray_image, bp, wp)
+    if curve_points and curve_points != [(0.0, 0.0), (1.0, 1.0)]:
+        gray_image = _curve_to_lut(curve_points)[gray_image]
     return gray_image
+
+
+def _curve_to_lut(curve_points: list[tuple[float, float]]) -> np.ndarray:
+    """A 256-entry uint8 lookup table from piecewise-linear (input,
+    output) control points in 0..1, applied after the black/white
+    levels stretch so it reshapes the already-normalized 0..255 range
+    without moving the black or white points themselves. Mirrors
+    :meth:`CurveWidget.to_lut` exactly, so what's drawn in the UI is
+    what actually gets applied.
+    """
+    points = sorted(curve_points, key=lambda p: p[0])
+    xs = np.array([p[0] for p in points]) * 255.0
+    ys = np.array([p[1] for p in points]) * 255.0
+    lut = np.interp(np.arange(256), xs, ys)
+    return np.clip(np.round(lut), 0, 255).astype(np.uint8)
 
 
 def compute_raster_auto_levels(

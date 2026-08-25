@@ -8,6 +8,7 @@ BurnPreviewWidget (walks a raygeo Ops object directly, for live
 settings-popup feedback).
 """
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -19,6 +20,11 @@ import cairo
 # down to 0.15*0.15 ~= 0.02 (near-black), clearly distinguishable from
 # one pass, while three or more get darker still.
 _MAX_SINGLE_PASS_DARKNESS = 0.85
+
+# Sub-stroke width used when `subdivide_dot` tiles a row's true dot
+# width out of parallel hairlines instead of one solid-width stroke --
+# see render_segments's docstring.
+_HAIRLINE_WIDTH_MM = 0.01
 
 
 @dataclass
@@ -39,9 +45,11 @@ def render_segments(
     reference_speed: float,
     px_per_mm: float,
     show_travel: bool = False,
+    cap_darkness: bool = True,
+    blend_multiply: bool = True,
+    subdivide_dot: bool = False,
 ) -> None:
-    """Stroke `segments` into `ctx` using MULTIPLY blending so
-    overlapping passes darken realistically. Caller owns the surface,
+    """Stroke `segments` into `ctx`. Caller owns the surface,
     coordinate transform, and background fill.
 
     Segments are drawn as strokes running along the scan direction, so
@@ -54,33 +62,91 @@ def render_segments(
     adjacent rows overlap or leave a visible gap. This doesn't account
     for a nonzero scan angle rotating which axis is "cross-scan" --
     accurate for the common angle=0 case, an approximation otherwise.
-    """
-    line_width_mm = max(spot_size_mm[1], 1.0 / px_per_mm)
 
-    ctx.set_operator(cairo.OPERATOR_MULTIPLY)
+    ``cap_darkness`` and ``blend_multiply`` are independent, both
+    default True (matching prior behavior), and only meant to be
+    turned off from the live preview's debug toggles -- see
+    BurnPreviewWidget / ImageEngraveStepSettingsPage. With both left
+    on: a single pass is capped at :data:`_MAX_SINGLE_PASS_DARKNESS`
+    and passes are composited with MULTIPLY, so genuinely-overlapping
+    strokes (MULTI_PASS re-scanning the same area, cross-hatch, or an
+    unintended overlap from too-tight line spacing / a wrong bidir
+    offset) visibly stack darker instead of the second pass being a
+    no-op on top of already-black. That headroom is wasted -- and
+    just desaturates the preview -- for a plain single-sweep job where
+    nothing ever overlaps the same pixel twice; the toggles let that
+    be checked directly instead of assumed.
+
+    ``blend_multiply=False`` also turns off antialiasing, not just the
+    MULTIPLY operator: cairo blends source and destination at any
+    partially-covered edge pixel regardless of operator (that's what
+    antialiasing *is*), so adjacent/overlapping strokes would still
+    show soft blended seams under plain OVER compositing otherwise --
+    defeating the point of asking for the un-blended, un-interpreted
+    view.
+
+    ``subdivide_dot``: normally each row is one stroke at the dot's
+    full width (see above), so overlap between adjacent rows renders
+    as one uniform double-covered band. When True, each segment is
+    instead drawn as several parallel :data:`_HAIRLINE_WIDTH_MM`-wide
+    strokes tiling the same total width -- functionally the same
+    coverage for an isolated row, but overlap between two rows whose
+    true offset isn't a whole multiple of the dot width now composites
+    hairline-by-hairline instead of as one all-or-nothing rectangle,
+    which is closer to how the real overlap fraction actually varies
+    continuously with row spacing.
+    """
+    dot_width_mm = spot_size_mm[1]
+    if subdivide_dot:
+        hairline_mm = max(_HAIRLINE_WIDTH_MM, 1.0 / px_per_mm)
+        n_hairlines = max(1, round(dot_width_mm / hairline_mm))
+        line_width_mm = hairline_mm
+    else:
+        hairline_mm = 0.0
+        n_hairlines = 1
+        line_width_mm = max(dot_width_mm, 1.0 / px_per_mm)
+
+    ctx.set_operator(
+        cairo.OPERATOR_MULTIPLY if blend_multiply else cairo.OPERATOR_OVER
+    )
+    ctx.set_antialias(
+        cairo.ANTIALIAS_DEFAULT if blend_multiply else cairo.ANTIALIAS_NONE
+    )
     ctx.set_line_cap(cairo.LINE_CAP_ROUND)
     ctx.set_line_width(line_width_mm)
+
+    max_darkness = _MAX_SINGLE_PASS_DARKNESS if cap_darkness else 1.0
 
     for seg in segments:
         if seg.is_travel:
             continue
         feed = seg.feed if seg.feed and seg.feed > 0 else reference_speed
         darkness = seg.power_fraction * (reference_speed / feed)
-        # Capped below 1.0 so a single pass at full power renders as a
-        # dark gray, not pure black -- leaving headroom for the
-        # MULTIPLY blend below to show overlapping passes (e.g. from
-        # too-tight line spacing or a wrong bidir offset) as visibly
-        # darker still. Full black would otherwise be a dead end: black
-        # multiplied by anything stays black, so a second overlapping
-        # pass would be invisible.
-        darkness = max(0.0, min(_MAX_SINGLE_PASS_DARKNESS, darkness))
+        darkness = max(0.0, min(max_darkness, darkness))
         if darkness <= 0.0:
             continue
         gray = 1.0 - darkness
         ctx.set_source_rgb(gray, gray, gray)
-        ctx.move_to(seg.x0, seg.y0)
-        ctx.line_to(seg.x1, seg.y1)
-        ctx.stroke()
+
+        if n_hairlines <= 1:
+            ctx.move_to(seg.x0, seg.y0)
+            ctx.line_to(seg.x1, seg.y1)
+            ctx.stroke()
+            continue
+
+        dx, dy = seg.x1 - seg.x0, seg.y1 - seg.y0
+        length = math.hypot(dx, dy)
+        if length < 1e-9:
+            perp_x, perp_y = 1.0, 0.0
+        else:
+            perp_x, perp_y = -dy / length, dx / length
+        span_mm = (n_hairlines - 1) * hairline_mm
+        for k in range(n_hairlines):
+            offset = k * hairline_mm - span_mm / 2
+            ox, oy = perp_x * offset, perp_y * offset
+            ctx.move_to(seg.x0 + ox, seg.y0 + oy)
+            ctx.line_to(seg.x1 + ox, seg.y1 + oy)
+            ctx.stroke()
 
     if show_travel:
         ctx.set_operator(cairo.OPERATOR_OVER)
@@ -106,6 +172,9 @@ def render_to_surface(
     height_px: int,
     margin_px: float = 4.0,
     show_travel: bool = False,
+    cap_darkness: bool = True,
+    blend_multiply: bool = True,
+    subdivide_dot: bool = False,
 ) -> cairo.ImageSurface:
     """Render `segments` fit-to-size into a standalone ARGB32 surface.
 
@@ -136,7 +205,15 @@ def render_to_surface(
     ctx.translate(offset_x - min_x * scale, offset_y + max_y * scale)
     ctx.scale(scale, -scale)
     render_segments(
-        ctx, segments, spot_size_mm, reference_speed, scale, show_travel
+        ctx,
+        segments,
+        spot_size_mm,
+        reference_speed,
+        scale,
+        show_travel,
+        cap_darkness=cap_darkness,
+        blend_multiply=blend_multiply,
+        subdivide_dot=subdivide_dot,
     )
     ctx.restore()
     return surface

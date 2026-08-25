@@ -513,6 +513,21 @@ class Pipeline:
         return self._store.get(handle)
 
     def get_existing_job_handle(self) -> BaseArtifactHandle | None:
+        """The last assembled job artifact, if it's still current.
+
+        ``_last_job_handle`` is only cleared on doc swap/shutdown/error
+        -- an ordinary step-param edit bumps ``generation_id`` without
+        touching it, so without this check every caller here (preview
+        refresh, the pre-export sanity check) would keep reusing a
+        stale job assembled before the edit instead of noticing it
+        needs to regenerate.
+        """
+        if (
+            self._last_job_handle is not None
+            and self._last_job_handle.generation_id
+            != self._intent_ctl.generation_id
+        ):
+            return None
         return self._last_job_handle
 
     # ------------------------------------------------------------------
@@ -543,7 +558,11 @@ class Pipeline:
             when_done(None, exc)
             return
 
-        if self._last_job_handle is not None:
+        if (
+            self._last_job_handle is not None
+            and self._last_job_handle.generation_id
+            == self._intent_ctl.generation_id
+        ):
             when_done(self._last_job_handle, None)
             return
 

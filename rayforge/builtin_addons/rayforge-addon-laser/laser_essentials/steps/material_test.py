@@ -276,14 +276,19 @@ class MaterialTestStep(LaserStep):
         )
         kwargs: dict = {}
         kwargs["size_mm"] = workpiece.size if workpiece else (0, 0)
+        # cols/rows/min_passes/max_passes bind to strict-integer Rust
+        # params (MaterialTestGridSpec) -- cast defensively rather
+        # than trusting the source is already int, since the settings
+        # UI's tuple rows are backed by float spin buttons (see
+        # TupleAdapter) and a saved recipe could carry JSON floats too.
         kwargs["cols"] = int(self.grid_dimensions[0])
         kwargs["rows"] = int(self.grid_dimensions[1])
         kwargs["min_speed"] = self.speed_range[0]
         kwargs["max_speed"] = self.speed_range[1]
         kwargs["min_power"] = self.power_range[0]
         kwargs["max_power"] = self.power_range[1]
-        kwargs["min_passes"] = self.passes_range[0]
-        kwargs["max_passes"] = self.passes_range[1]
+        kwargs["min_passes"] = int(self.passes_range[0])
+        kwargs["max_passes"] = int(self.passes_range[1])
         kwargs["min_offset"] = self.offset_range[0]
         kwargs["max_offset"] = self.offset_range[1]
         kwargs["mode"] = "cut" if self.test_type == "Cut" else "engrave"

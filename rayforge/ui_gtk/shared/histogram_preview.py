@@ -197,9 +197,17 @@ class HistogramPreview(Gtk.DrawingArea):
         draw_height = height - 2 * self.MARGIN
 
         if self.histogram is not None:
-            max_count = (
-                np.max(self.histogram) if np.max(self.histogram) > 0 else 1
-            )
+            # Real images are usually dominated by one or two bins (a
+            # solid background/margin), which at a raw linear count
+            # dwarfs every other bin down to a flat near-zero line --
+            # exactly the "big white spike, flat everywhere else"
+            # look. log1p compresses that spike while still mapping
+            # zero counts to zero height, so the actual tonal spread
+            # stays visible. This is what photo editors' histograms
+            # do too (Photoshop/Lightroom/GIMP all scale their
+            # histogram display logarithmically by default).
+            log_counts = np.log1p(self.histogram)
+            log_max = np.max(log_counts) if np.max(log_counts) > 0 else 1
 
             bar_width = draw_width / len(self.histogram)
 
@@ -207,9 +215,9 @@ class HistogramPreview(Gtk.DrawingArea):
             ctx.set_source_rgba(
                 color.red, color.green, color.blue, color.alpha
             )
-            for i, count in enumerate(self.histogram):
+            for i, count in enumerate(log_counts):
                 x = self.MARGIN + i * bar_width
-                bar_height = (count / max_count) * draw_height
+                bar_height = (count / log_max) * draw_height
                 ctx.rectangle(
                     x,
                     height - self.MARGIN - bar_height,

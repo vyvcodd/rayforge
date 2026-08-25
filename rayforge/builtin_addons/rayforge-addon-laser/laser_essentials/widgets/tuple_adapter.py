@@ -48,12 +48,22 @@ class TupleAdapter(RowAdapter):
         extra: Adw.PreferencesRow,
         spins: list[SpinRow],
         quantity: str | None = None,
+        integer: bool = False,
     ) -> None:
         super().__init__()
         self._row = row
         self._extra = extra
         self._spins = spins
         self._quantity = quantity
+        # SpinRow.get_value() always returns a float (the underlying
+        # GtkAdjustment is double-precision), regardless of digits --
+        # digits only controls display formatting. A whole-number
+        # tuple (digits=0, e.g. grid_dimensions/passes_range) needs
+        # real ints back: several of these values flow straight into
+        # Rust bindings with strict integer params (e.g.
+        # MaterialTestGridSpec's cols/rows), which raise TypeError on
+        # a float rather than silently coercing it.
+        self._integer = integer
         for spin in spins:
             spin.value_changed.connect(
                 lambda s: self.changed.send(self), weak=False
@@ -128,7 +138,9 @@ class TupleAdapter(RowAdapter):
                 escape_title(var.description)
             )
 
-        return row, cls(row, extra, [row, extra], quantity)
+        return row, cls(
+            row, extra, [row, extra], quantity, integer=digits == 0
+        )
 
     def extra_rows(self) -> list[Adw.PreferencesRow]:
         """The second component's row, appended after the primary."""
@@ -140,6 +152,8 @@ class TupleAdapter(RowAdapter):
                 cast(UnitSpinRow, spin).get_value_in_base_units()
                 for spin in self._spins
             )
+        if self._integer:
+            return tuple(spin.get_int_value() for spin in self._spins)
         return tuple(spin.get_value() for spin in self._spins)
 
     def set_value(self, value: Any) -> None:

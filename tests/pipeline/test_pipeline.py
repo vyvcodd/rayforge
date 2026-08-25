@@ -451,3 +451,61 @@ class TestPipeline:
 
         # Assert
         assert result is None
+
+    def test_get_existing_job_handle_returns_none_when_stale(
+        self,
+        doc,
+        mock_task_mgr,
+        context_initializer,
+    ):
+        """A cached job handle from an earlier generation (e.g. before
+        a step param edit bumped generation_id) must not be reused --
+        this is exactly what made the 3D preview and the pre-export
+        sanity check keep showing/checking a stale job after editing
+        a step (see MaterialTestStep grid_dimensions bug report)."""
+        pipeline = Pipeline(
+            doc,
+            mock_task_mgr,
+            context_initializer.artifact_store,
+            context_initializer.machine,
+        )
+        stale_handle = WorkPieceArtifactHandle(
+            is_scalable=True,
+            generation_size=(10.0, 10.0),
+            key="stale-job",
+            handle_class_name="WorkPieceArtifactHandle",
+            artifact_type_name="JobArtifact",
+            generation_id=pipeline._intent_ctl.generation_id,
+        )
+        pipeline._last_job_handle = stale_handle
+
+        # A newer generation happened after the job was cached.
+        pipeline._intent_ctl._generation_id += 1
+
+        assert pipeline.get_existing_job_handle() is None
+
+    def test_get_existing_job_handle_returns_handle_when_current(
+        self,
+        doc,
+        mock_task_mgr,
+        context_initializer,
+    ):
+        """A cached job handle from the current generation is reused,
+        as an optimization to avoid a needless rebuild."""
+        pipeline = Pipeline(
+            doc,
+            mock_task_mgr,
+            context_initializer.artifact_store,
+            context_initializer.machine,
+        )
+        current_handle = WorkPieceArtifactHandle(
+            is_scalable=True,
+            generation_size=(10.0, 10.0),
+            key="current-job",
+            handle_class_name="WorkPieceArtifactHandle",
+            artifact_type_name="JobArtifact",
+            generation_id=pipeline._intent_ctl.generation_id,
+        )
+        pipeline._last_job_handle = current_handle
+
+        assert pipeline.get_existing_job_handle() is current_handle

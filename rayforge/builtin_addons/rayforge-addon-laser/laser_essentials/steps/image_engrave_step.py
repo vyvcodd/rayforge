@@ -32,10 +32,12 @@ from rayforge.pipeline.stage.assembler_helpers import (
     DepthMode,
     compute_raster_auto_levels,
     preprocess_raster_image,
+    preprocess_raster_image_vips,
 )
 from rayforge.pipeline.transformer.registry import transformer_registry
 
 from ..levels_range_var import LevelsRangeVar
+from ..power_curve_var import PowerCurveVar
 from ..scan_angle_var import ScanAngleVar
 from .laser_step import LaserStep
 
@@ -81,6 +83,10 @@ class ImageEngraveStep(LaserStep):
         self.auto_levels = True
         self.black_point = 0
         self.white_point = 255
+        self.curve_points: list[tuple[float, float]] = [
+            (0.0, 0.0),
+            (1.0, 1.0),
+        ]
         self.threshold = 128
         self.line_interval_mm = None
         self.sample_interval_mm = None
@@ -266,6 +272,15 @@ class ImageEngraveStep(LaserStep):
                     default=255,
                     min_val=0,
                     max_val=255,
+                    visible_when=uses_grayscale,
+                ),
+                PowerCurveVar(
+                    key="curve_points",
+                    description=_(
+                        "Midtone correction applied after the black/"
+                        "white points -- drag points to reshape how "
+                        "brightness maps to power between them"
+                    ),
                     visible_when=uses_grayscale,
                 ),
                 SliderFloatVar(
@@ -459,6 +474,7 @@ class ImageEngraveStep(LaserStep):
                 "auto_levels": self.auto_levels,
                 "black_point": self.black_point,
                 "white_point": self.white_point,
+                "curve_points": self.curve_points,
                 "threshold": self.threshold,
                 "dither_algorithm": (
                     self.dither_algorithm.name
@@ -477,6 +493,7 @@ class ImageEngraveStep(LaserStep):
         result["auto_levels"] = self.auto_levels
         result["black_point"] = self.black_point
         result["white_point"] = self.white_point
+        result["curve_points"] = [list(p) for p in self.curve_points]
         result["threshold"] = self.threshold
         result["line_interval_mm"] = self.line_interval_mm
         result["sample_interval_mm"] = self.sample_interval_mm
@@ -506,6 +523,12 @@ class ImageEngraveStep(LaserStep):
         step.auto_levels = data.get("auto_levels", True)
         step.black_point = data.get("black_point", 0)
         step.white_point = data.get("white_point", 255)
+        curve_points = data.get("curve_points")
+        step.curve_points = (
+            [tuple(p) for p in curve_points]
+            if curve_points
+            else [(0.0, 0.0), (1.0, 1.0)]
+        )
         step.threshold = data.get("threshold", 128)
         step.line_interval_mm = data.get("line_interval_mm", None)
         step.sample_interval_mm = data.get("sample_interval_mm", None)
@@ -541,6 +564,7 @@ class ImageEngraveStep(LaserStep):
                 "auto_levels",
                 "black_point",
                 "white_point",
+                "curve_points",
                 "threshold",
                 "line_interval_mm",
                 "sample_interval_mm",
@@ -633,15 +657,33 @@ def _build_raster_part(
     machine: Machine,
     workpiece: WorkPiece,
 ) -> tuple[Part, np.ndarray | None]:
-    """Render and preprocess the workpiece into a :class:`Part`
-    carrying a :class:`WholeImageSource`, and return the alpha
-    channel separately so the caller can fold it into the
-    :class:`RasterSpec`.
+    """Render and preprocess the workpiece into a :class:`Part`, and
+    return the alpha channel separately so the caller can fold it
+    into the :class:`RasterSpec`.
 
-    The rendering resolution is clamped to
-    :data:`MAX_RASTER_RENDER_PIXELS` to bound memory.  Auto-levels
-    are precomputed here (see target-architecture.md B3.3) so all
-    slabs see consistent black/white points.
+    Every mode except DITHER streams through pyvips into a
+    :class:`VipsChunkSource` instead of a :class:`WholeImageSource`,
+    at the workpiece's full, uncapped resolution -- raygeo reads it
+    back in horizontal slabs on demand rather than requiring one
+    materialized array. This exists because :data:`MAX_RASTER_RENDER_PIXELS`
+    used to cap that resolution for *every* mode: past a large-enough
+    workpiece at a fine line_interval_mm, the rendered image ended up
+    coarser than the actual scan-line pitch, so consecutive scan lines
+    silently read the same source row and rendered as identical power
+    -- a real loss of engrave resolution on large jobs, not just a
+    preview artifact (confirmed by reproducing it directly: groups of
+    N consecutive scan lines sharing one power value, N growing
+    linearly with workpiece size once the cap engaged).
+
+    DITHER is the one mode that can't take this path: Floyd-Steinberg
+    dithering (raygeo's ``apply_floyd_steinberg_dither``) is a
+    compiled, whole-array-in-whole-array-out function with no chunked
+    variant, so it still needs a fully materialized array and stays on
+    the capped cairo/numpy path below.
+
+    Auto-levels are precomputed here (see target-architecture.md B3.3)
+    so all slabs -- streamed or not -- see consistent black/white
+    points.
     """
     size = workpiece.size
     if size[0] <= 0 or size[1] <= 0:
@@ -665,11 +707,15 @@ def _build_raster_part(
 
     target_w = max(1, int(size[0] * px_per_mm_x))
     target_h = max(1, int(size[1] * px_per_mm_y))
-    num_pixels = target_w * target_h
-    if num_pixels > MAX_RASTER_RENDER_PIXELS:
-        scale = (MAX_RASTER_RENDER_PIXELS / num_pixels) ** 0.5
-        target_w = max(1, int(target_w * scale))
-        target_h = max(1, int(target_h * scale))
+
+    depth_mode = DepthMode[step.depth_mode]
+
+    if depth_mode == DepthMode.DITHER:
+        num_pixels = target_w * target_h
+        if num_pixels > MAX_RASTER_RENDER_PIXELS:
+            scale = (MAX_RASTER_RENDER_PIXELS / num_pixels) ** 0.5
+            target_w = max(1, int(target_w * scale))
+            target_h = max(1, int(target_h * scale))
 
     # Recompute pixels-per-mm from the actual integer target dimensions so
     # that the rendered image pixels exactly cover the workpiece size.
@@ -678,12 +724,6 @@ def _build_raster_part(
     px_per_mm_x = target_w / size[0]
     px_per_mm_y = target_h / size[1]
 
-    surface = workpiece.render_to_pixels(target_w, target_h)
-    if surface is None:
-        return Part(size_mm=size), None
-
-    depth_mode = DepthMode[step.depth_mode]
-
     computed_auto_levels = None
     if step.auto_levels:
         computed_auto_levels = compute_raster_auto_levels(
@@ -691,6 +731,52 @@ def _build_raster_part(
             (px_per_mm_x, px_per_mm_y),
             invert=step.invert,
         )
+
+    part = Part(size_mm=size, pixels_per_mm=(px_per_mm_x, px_per_mm_y))
+
+    if depth_mode != DepthMode.DITHER:
+        vips_image = workpiece.get_vips_image(target_w, target_h)
+        if vips_image is None:
+            return Part(size_mm=size), None
+        gray_vips, alpha_vips = preprocess_raster_image_vips(
+            vips_image,
+            mode=depth_mode,
+            invert=step.invert,
+            auto_levels=step.auto_levels,
+            computed_auto_levels=computed_auto_levels,
+            black_point=step.black_point,
+            white_point=step.white_point,
+            curve_points=step.curve_points,
+            threshold=step.threshold,
+        )
+        # TODO(raygeo): VipsChunkSource.read_slab()/read_all() return
+        # zeroed/empty data in raygeo 1.41.1 even for a trivial,
+        # correctly-constructed single-band uchar image (verified
+        # directly, several construction paths, all reproduce it) --
+        # file upstream and swap this for VipsChunkSource(gray_vips)
+        # once fixed, to get true bounded-memory streaming instead of
+        # materializing the full array below.
+        gray_np = np.ndarray(
+            buffer=gray_vips.write_to_memory(),
+            dtype=np.uint8,
+            shape=(gray_vips.height, gray_vips.width),
+        )
+        part.image_source = WholeImageSource(gray_np)
+        alpha = None
+        if alpha_vips is not None:
+            alpha = (
+                np.ndarray(
+                    buffer=alpha_vips.write_to_memory(),
+                    dtype=np.uint8,
+                    shape=(alpha_vips.height, alpha_vips.width),
+                ).astype(np.float32)
+                / 255.0
+            )
+        return part, alpha
+
+    surface = workpiece.render_to_pixels(target_w, target_h)
+    if surface is None:
+        return Part(size_mm=size), None
 
     dot_width = (
         step.dot_width_correction_mm
@@ -705,6 +791,7 @@ def _build_raster_part(
         computed_auto_levels=computed_auto_levels,
         black_point=step.black_point,
         white_point=step.white_point,
+        curve_points=step.curve_points,
         threshold=step.threshold,
         dither_algorithm=step.dither_algorithm,
         laser_spot_x_mm=spot_x,
@@ -715,10 +802,6 @@ def _build_raster_part(
     if image is None:
         return Part(size_mm=size), None
 
-    part = Part(
-        size_mm=size,
-        pixels_per_mm=(px_per_mm_x, px_per_mm_y),
-    )
     part.image_source = WholeImageSource(image)
     return part, alpha
 

@@ -16,7 +16,7 @@ from gettext import gettext as _
 from typing import TYPE_CHECKING, Any
 
 import cairo
-from gi.repository import GLib, Gtk
+from gi.repository import Adw, GLib, Gtk
 
 from rayforge.core.varset import VarSet
 from rayforge.image.burn_preview import Segment, render_to_surface
@@ -24,8 +24,11 @@ from rayforge.image.ops_burn_preview import segments_from_ops
 from rayforge.machine.models.laser import LaserHead
 from rayforge.ui_gtk.shared.burn_preview_widget import BurnPreviewWidget
 
+from ..levels_range_var import LevelsRangeVar
+from ..power_curve_var import PowerCurveVar
 from .laser_step_page import LaserStepSettingsPage
 from .levels_adapter import LevelsAdapter
+from .power_curve_adapter import PowerCurveAdapter
 from .raster_power_widget import RasterPowerWidget
 
 logger = logging.getLogger(__name__)
@@ -54,6 +57,7 @@ _POWER_KEYS = {
     "auto_levels",
     "black_point",
     "white_point",
+    "curve_points",
     "min_power_level",
     "max_power_level",
     "num_power_levels",
@@ -89,7 +93,27 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
         engrave_vs = VarSet(
             vars=[v for v in step_vars if v.key in _ENGRAVE_KEYS]
         )
-        power_vs = VarSet(vars=[v for v in step_vars if v.key in _POWER_KEYS])
+        # The histogram/levels and power-curve controls are rendered
+        # in the burn-preview side panel instead (see
+        # _attach_side_panel), wider and next to the preview they
+        # describe -- swap in copies of these vars with visible_when
+        # forced to False rather than dropping them, so their step
+        # attributes keep flowing through the normal varset get/set/
+        # adapter machinery. visible_when has no setter (Var exposes
+        # it read-only), so this rebuilds the vars instead of
+        # mutating the originals.
+        def _hidden(v):
+            if v.key == "black_point":
+                return LevelsRangeVar(visible_when=lambda values: False)
+            if v.key == "curve_points":
+                return PowerCurveVar(visible_when=lambda values: False)
+            return v
+
+        power_vs = VarSet(
+            vars=[
+                _hidden(v) for v in step_vars if v.key in _POWER_KEYS
+            ]
+        )
         self.engrave_widget = self.add_varset_section(
             _("Engrave"),
             engrave_vs,
@@ -116,14 +140,38 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                 )
 
         levels = self.power_widget.adapter_for("black_point")
-        if isinstance(levels, LevelsAdapter):
-            levels.set_histogram_source(step)
-            GLib.idle_add(levels.compute_histogram)
+        self.levels_adapter = (
+            levels if isinstance(levels, LevelsAdapter) else None
+        )
+        if self.levels_adapter is not None:
+            self.levels_adapter.set_histogram_source(step)
+            GLib.idle_add(self.levels_adapter.compute_histogram)
+
+        curve = self.power_widget.adapter_for("curve_points")
+        self.curve_adapter = (
+            curve if isinstance(curve, PowerCurveAdapter) else None
+        )
 
         self._push_head_defaults()
 
         # --- Burn Preview (handed to the dialog's side panel, not
         # added as a settings row -- see StepSettingsDialog.set_side_panel) ---
+        # Debug toggles for the two effects that make a single-sweep
+        # preview harder to read than the job actually is -- see
+        # render_segments's docstring. Default on (prior behavior);
+        # the panel switches let both be checked independently.
+        self._preview_cap_darkness = True
+        self._preview_blend_multiply = True
+        self._preview_subdivide_dot = False
+        # Manual override for the render resolution's zoom factor (see
+        # _on_rerender_clicked): 1.0 = the normal fixed _DOTS_PER_SPOT
+        # resolution. Deliberately not automatic/tied to scroll events
+        # -- re-rendering is the expensive background compute, and
+        # doing that on every zoom tick is exactly the kind of
+        # unbounded-cost-on-a-continuous-gesture mistake the debounced
+        # downsample fix above had to walk back. A button lets this be
+        # validated cheaply before committing to that.
+        self._preview_render_zoom_boost = 1.0
         self.burn_preview = BurnPreviewWidget()
         self.editor.pipeline.workpiece_artifact_ready.connect(
             self._on_workpiece_artifact_ready
@@ -206,6 +254,22 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                     css_classes=["title-4"],
                 )
             )
+            rerender_button = Gtk.Button.new_from_icon_name(
+                "view-refresh-symbolic"
+            )
+            rerender_button.set_tooltip_text(
+                _(
+                    "Re-render at the current zoom level -- the "
+                    "preview's native resolution is fixed at render "
+                    "time (just enough to show gaps/overlap, not to "
+                    "resolve individual dots), so scrolling in past "
+                    "1:1 only magnifies those same pixels rather than "
+                    "showing real detail. This re-renders from scratch "
+                    "at a resolution matched to your current zoom."
+                )
+            )
+            rerender_button.connect("clicked", self._on_rerender_clicked)
+            header_row.append(rerender_button)
             reset_view_button = Gtk.Button.new_from_icon_name(
                 "zoom-original-symbolic"
             )
@@ -223,6 +287,105 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                 )
             )
             panel.append(self.burn_preview)
+
+            if self.levels_adapter is not None:
+                panel.append(
+                    Gtk.Separator(margin_top=6, margin_bottom=6)
+                )
+                panel.append(
+                    Gtk.Label(
+                        label=_("Levels"),
+                        halign=Gtk.Align.START,
+                        css_classes=["title-4"],
+                    )
+                )
+                levels_subtitle = Gtk.Label(
+                    halign=Gtk.Align.START,
+                    css_classes=["dim-label", "caption"],
+                    wrap=True,
+                )
+                panel.append(levels_subtitle)
+                levels_preview = self.levels_adapter.detach_preview()
+                levels_preview.set_hexpand(True)
+                levels_preview.set_content_height(110)
+                panel.append(levels_preview)
+                self.levels_adapter.set_subtitle_label(levels_subtitle)
+
+            if self.curve_adapter is not None:
+                panel.append(
+                    Gtk.Separator(margin_top=6, margin_bottom=6)
+                )
+                panel.append(
+                    Gtk.Label(
+                        label=_("Power Curve"),
+                        halign=Gtk.Align.START,
+                        css_classes=["title-4"],
+                    )
+                )
+                curve_subtitle = Gtk.Label(
+                    halign=Gtk.Align.START,
+                    css_classes=["dim-label", "caption"],
+                    wrap=True,
+                )
+                panel.append(curve_subtitle)
+                curve_widget = self.curve_adapter.detach_curve()
+                curve_widget.set_hexpand(True)
+                curve_widget.set_content_height(140)
+                panel.append(curve_widget)
+                self.curve_adapter.set_subtitle_label(curve_subtitle)
+
+            # Debug toggles for the preview's own darkening effects
+            # (see render_segments's docstring) -- off by default
+            # would misrepresent the job as flatter than it is; on
+            # lets you check whether either effect is actually
+            # relevant to what you're looking at, by turning it off
+            # and re-rendering.
+            debug_list = Gtk.ListBox(
+                selection_mode=Gtk.SelectionMode.NONE,
+                css_classes=["boxed-list"],
+                margin_top=6,
+            )
+            cap_row = Adw.SwitchRow(
+                title=_("Cap Single-Pass Darkness"),
+                subtitle=_(
+                    "Limit one pass to dark gray, leaving room to "
+                    "show overlapping passes as darker still"
+                ),
+                active=self._preview_cap_darkness,
+            )
+            cap_row.connect(
+                "notify::active", self._on_cap_darkness_toggled
+            )
+            debug_list.append(cap_row)
+            blend_row = Adw.SwitchRow(
+                title=_("Darken Overlapping Passes"),
+                subtitle=_(
+                    "Multiply overlapping strokes together and "
+                    "antialias edges, instead of a crisp, un-blended "
+                    "paint-over"
+                ),
+                active=self._preview_blend_multiply,
+            )
+            blend_row.connect(
+                "notify::active", self._on_blend_multiply_toggled
+            )
+            debug_list.append(blend_row)
+            subdivide_row = Adw.SwitchRow(
+                title=_("Subdivide Dot Width"),
+                subtitle=_(
+                    "Draw each row as several thin hairlines tiling "
+                    "the true dot width, instead of one solid stroke "
+                    "-- shows partial row-to-row overlap as a gradient "
+                    "rather than an all-or-nothing band"
+                ),
+                active=self._preview_subdivide_dot,
+            )
+            subdivide_row.connect(
+                "notify::active", self._on_subdivide_dot_toggled
+            )
+            debug_list.append(subdivide_row)
+            panel.append(debug_list)
+
             set_side_panel(panel)
         if isinstance(root, Gtk.Window):
             root.set_default_size(950, 700)
@@ -233,6 +396,28 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
     ):
         if step.uid != self.step.uid:
             return
+        self._recompute_burn_preview()
+
+    def _on_cap_darkness_toggled(self, row, pspec):
+        self._preview_cap_darkness = row.get_active()
+        self._recompute_burn_preview()
+
+    def _on_blend_multiply_toggled(self, row, pspec):
+        self._preview_blend_multiply = row.get_active()
+        # The widget's own blit also smooths/interpolates whenever the
+        # rendered surface is scaled to fit -- almost always -- which
+        # reintroduces blending no matter how crisp render_to_surface
+        # made the surface itself. Keep both in lockstep so the toggle
+        # actually gives a literal, un-blended pixel view.
+        self.burn_preview.set_smooth_scaling(self._preview_blend_multiply)
+        self._recompute_burn_preview()
+
+    def _on_subdivide_dot_toggled(self, row, pspec):
+        self._preview_subdivide_dot = row.get_active()
+        self._recompute_burn_preview()
+
+    def _on_rerender_clicked(self, button):
+        self._preview_render_zoom_boost = max(1.0, self.burn_preview.get_zoom())
         self._recompute_burn_preview()
 
     def _recompute_burn_preview(self):
@@ -290,6 +475,13 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
         # pixels are exactly step_power (no separate max-power scaling)
         # so this correctly maps them to 1.0 either way.
         step_power = max(self.step.power, 1e-6)
+        # Snapshot the debug toggles for this render: _compute runs on
+        # a background thread, so it must not read self._preview_* live
+        # while the user might be flipping them for the next one.
+        cap_darkness = self._preview_cap_darkness
+        blend_multiply = self._preview_blend_multiply
+        subdivide_dot = self._preview_subdivide_dot
+        render_zoom_boost = self._preview_render_zoom_boost
 
         if not ops_list:
             self.burn_preview.update_surface(None)
@@ -368,7 +560,16 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                 smallest_feature_mm = min(
                     smallest_feature_mm, line_interval_mm - spot_avg_mm
                 )
-            px_per_mm = _DOTS_PER_SPOT / max(smallest_feature_mm, 1e-6)
+            # render_zoom_boost > 1.0 only when the user explicitly hit
+            # "re-render at current zoom" -- see _on_rerender_clicked.
+            # Not tied to scroll events automatically: re-rendering is
+            # the expensive background compute, and doing that on
+            # every zoom tick would reintroduce the same
+            # continuous-gesture cost problem the downsample debounce
+            # above had to fix.
+            px_per_mm = (
+                _DOTS_PER_SPOT / max(smallest_feature_mm, 1e-6)
+            ) * render_zoom_boost
             width_px = content_w_mm * px_per_mm
             height_px = content_h_mm * px_per_mm
 
@@ -388,6 +589,9 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                 reference_speed,
                 width_px,
                 height_px,
+                cap_darkness=cap_darkness,
+                blend_multiply=blend_multiply,
+                subdivide_dot=subdivide_dot,
             )
 
         def _on_done(task):
@@ -415,3 +619,4 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
         self.editor.pipeline.workpiece_artifact_ready.disconnect(
             self._on_workpiece_artifact_ready
         )
+        self.burn_preview.cleanup()

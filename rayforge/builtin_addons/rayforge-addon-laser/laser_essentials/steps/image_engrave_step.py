@@ -813,6 +813,24 @@ def _build_raster_part(
                 ).astype(np.float32)
                 / 255.0
             )
+        elif depth_mode == DepthMode.POWER_MODULATION:
+            # Workaround for a raygeo bug (assemble_raster's
+            # "power_modulated" branch): when no alpha array is given,
+            # it substitutes the *grayscale* image as alpha instead of
+            # treating every pixel as opaque. compute_power_values()
+            # then zeroes any pixel whose alpha == 0 -- but gray == 0
+            # is a legitimate max_power (darkest) value in this mode,
+            # not "no content", so pure-black pixels silently get
+            # forced to 0% power (and if enough of the image quantizes
+            # to exactly 0 -- routine with a low num_power_levels or
+            # power_level_boundaries -- find_mask_bounding_box() over
+            # that same substituted "alpha" can come back empty,
+            # dropping the whole scan). An explicit all-opaque alpha
+            # sidesteps the substitution entirely. Confirmed against
+            # raygeo's Rust source directly; drop this once fixed
+            # upstream and this mode gets to keep skipping the alpha
+            # buffer for opaque workpieces like the others do.
+            alpha = np.ones(gray_np.shape, dtype=np.float32)
         return part, alpha
 
     surface = workpiece.render_to_pixels(target_w, target_h)

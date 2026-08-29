@@ -306,6 +306,9 @@ def preprocess_raster_image(
     computed_auto_levels: tuple[int, int] | None = None,
     black_point: int = 0,
     white_point: int = 255,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    gamma: float = 1.0,
     curve_points: list[tuple[float, float]] | None = None,
     power_level_boundaries: list[float] | None = None,
     threshold: int = 128,
@@ -384,6 +387,9 @@ def preprocess_raster_image(
             computed_auto_levels=computed_auto_levels,
             black_point=black_point,
             white_point=white_point,
+            brightness=brightness,
+            contrast=contrast,
+            gamma=gamma,
             curve_points=curve_points,
             power_level_boundaries=power_level_boundaries,
         )
@@ -416,6 +422,9 @@ def preprocess_raster_image(
             computed_auto_levels=computed_auto_levels,
             black_point=black_point,
             white_point=white_point,
+            brightness=brightness,
+            contrast=contrast,
+            gamma=gamma,
             curve_points=curve_points,
         )
         image = grayscale_to_dithered_array(
@@ -448,6 +457,9 @@ def preprocess_raster_image_vips(
     computed_auto_levels: tuple[int, int] | None = None,
     black_point: int = 0,
     white_point: int = 255,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    gamma: float = 1.0,
     curve_points: list[tuple[float, float]] | None = None,
     power_level_boundaries: list[float] | None = None,
     threshold: int = 128,
@@ -532,6 +544,16 @@ def preprocess_raster_image_vips(
         offset = -bp * scale
         gray = gray.linear(scale, offset).round("rint").cast("uchar")
 
+    if brightness or contrast or gamma != 1.0:
+        # Brightness/Contrast/Gamma, as a LUT for the same reason
+        # curve_points is one -- a single vips maplut instead of three
+        # separate per-pixel passes. Ahead of the curve so both
+        # compose: BCG for a quick baseline exposure fix, the curve
+        # for finer reshaping on top of it.
+        lut_arr = _bcg_to_lut(brightness, contrast, gamma)
+        lut_img = pyvips.Image.new_from_array([list(lut_arr)])
+        gray = gray.maplut(lut_img).cast("uchar")
+
     if curve_points and curve_points != [(0.0, 0.0), (1.0, 1.0)]:
         # Midtone curve after the levels stretch, as a LUT applied via
         # vips's own maplut op -- matches the numpy path's
@@ -561,11 +583,15 @@ def _apply_raster_levels(
     computed_auto_levels: tuple[int, int] | None = None,
     black_point: int = 0,
     white_point: int = 255,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    gamma: float = 1.0,
     curve_points: list[tuple[float, float]] | None = None,
     power_level_boundaries: list[float] | None = None,
 ) -> np.ndarray:
     """Apply auto-levels or manual black/white-point normalization,
-    then a midtone curve, then non-uniform power-level banding.
+    then brightness/contrast/gamma, then a midtone curve, then
+    non-uniform power-level banding.
 
     This is the standalone equivalent of ``Rasterizer._apply_levels``.
     """
@@ -579,6 +605,8 @@ def _apply_raster_levels(
 
     if bp > 0 or wp < 255:
         gray_image = normalize_grayscale(gray_image, bp, wp)
+    if brightness or contrast or gamma != 1.0:
+        gray_image = _bcg_to_lut(brightness, contrast, gamma)[gray_image]
     if curve_points and curve_points != [(0.0, 0.0), (1.0, 1.0)]:
         gray_image = _curve_to_lut(curve_points)[gray_image]
     if power_level_boundaries:
@@ -599,6 +627,36 @@ def _curve_to_lut(curve_points: list[tuple[float, float]]) -> np.ndarray:
     ys = np.array([p[1] for p in points]) * 255.0
     lut = np.interp(np.arange(256), xs, ys)
     return np.clip(np.round(lut), 0, 255).astype(np.uint8)
+
+
+def _bcg_to_lut(
+    brightness: float, contrast: float, gamma: float
+) -> np.ndarray:
+    """A 256-entry uint8 lookup table for brightness/contrast/gamma,
+    applied in that order and composing with (not replacing) the
+    freeform power curve: BCG for a quick, familiar baseline
+    adjustment, the curve for finer reshaping on top of it.
+
+    :param brightness: Percentage (-100..100). Added as
+        ``brightness / 100 * 255`` pixel units before contrast, so it
+        shifts the whole range up or down.
+    :param contrast: Percentage (-100..100). ``output = (input - 128)
+        * (1 + contrast / 100) + 128`` -- -100 flattens everything to
+        mid-gray, 0 is unchanged, 100 doubles the spread around
+        mid-gray. Applied after brightness, before gamma.
+    :param gamma: Standard display-gamma exponent (> 0). ``output =
+        255 * (input / 255) ** (1 / gamma)`` -- 1.0 is unchanged,
+        > 1.0 brightens midtones, < 1.0 darkens them. Applied last, so
+        it reshapes the midtones of the already brightness/contrast
+        -adjusted range rather than the raw input.
+    """
+    x = np.arange(256, dtype=np.float64)
+    x = x + (brightness / 100.0) * 255.0
+    x = (x - 128.0) * (1.0 + contrast / 100.0) + 128.0
+    x = np.clip(x, 0.0, 255.0)
+    if gamma != 1.0:
+        x = 255.0 * (x / 255.0) ** (1.0 / gamma)
+    return np.clip(np.round(x), 0, 255).astype(np.uint8)
 
 
 def _boundaries_to_lut(boundaries: list[float]) -> np.ndarray:

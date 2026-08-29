@@ -84,6 +84,9 @@ class ImageEngraveStep(LaserStep):
         self.auto_levels = True
         self.black_point = 0
         self.white_point = 255
+        self.brightness = 0.0
+        self.contrast = 0.0
+        self.gamma = 1.0
         self.curve_points: list[tuple[float, float]] = [
             (0.0, 0.0),
             (1.0, 1.0),
@@ -274,6 +277,49 @@ class ImageEngraveStep(LaserStep):
                     default=255,
                     min_val=0,
                     max_val=255,
+                    visible_when=uses_grayscale,
+                ),
+                SliderFloatVar(
+                    key="brightness",
+                    label=_("Brightness"),
+                    description=_(
+                        "Shifts the whole brightness range up or down, "
+                        "applied after the black/white points. 0 is "
+                        "unchanged"
+                    ),
+                    default=0.0,
+                    min_val=-100.0,
+                    max_val=100.0,
+                    show_value=True,
+                    digits=0,
+                    visible_when=uses_grayscale,
+                ),
+                SliderFloatVar(
+                    key="contrast",
+                    label=_("Contrast"),
+                    description=_(
+                        "Stretches (or flattens) brightness around "
+                        "mid-gray. 0 is unchanged"
+                    ),
+                    default=0.0,
+                    min_val=-100.0,
+                    max_val=100.0,
+                    show_value=True,
+                    digits=0,
+                    visible_when=uses_grayscale,
+                ),
+                SliderFloatVar(
+                    key="gamma",
+                    label=_("Gamma"),
+                    description=_(
+                        "Reshapes midtones -- above 1.0 brightens them, "
+                        "below 1.0 darkens them. 1.0 is unchanged"
+                    ),
+                    default=1.0,
+                    min_val=0.1,
+                    max_val=3.0,
+                    show_value=True,
+                    digits=2,
                     visible_when=uses_grayscale,
                 ),
                 PowerCurveVar(
@@ -485,6 +531,9 @@ class ImageEngraveStep(LaserStep):
                 "auto_levels": self.auto_levels,
                 "black_point": self.black_point,
                 "white_point": self.white_point,
+                "brightness": self.brightness,
+                "contrast": self.contrast,
+                "gamma": self.gamma,
                 "curve_points": self.curve_points,
                 "power_level_boundaries": self.power_level_boundaries,
                 "threshold": self.threshold,
@@ -505,6 +554,9 @@ class ImageEngraveStep(LaserStep):
         result["auto_levels"] = self.auto_levels
         result["black_point"] = self.black_point
         result["white_point"] = self.white_point
+        result["brightness"] = self.brightness
+        result["contrast"] = self.contrast
+        result["gamma"] = self.gamma
         result["curve_points"] = [list(p) for p in self.curve_points]
         result["threshold"] = self.threshold
         result["line_interval_mm"] = self.line_interval_mm
@@ -536,6 +588,9 @@ class ImageEngraveStep(LaserStep):
         step.auto_levels = data.get("auto_levels", True)
         step.black_point = data.get("black_point", 0)
         step.white_point = data.get("white_point", 255)
+        step.brightness = data.get("brightness", 0.0)
+        step.contrast = data.get("contrast", 0.0)
+        step.gamma = data.get("gamma", 1.0)
         curve_points = data.get("curve_points")
         step.curve_points = (
             [tuple(p) for p in curve_points]
@@ -581,6 +636,9 @@ class ImageEngraveStep(LaserStep):
                 "auto_levels",
                 "black_point",
                 "white_point",
+                "brightness",
+                "contrast",
+                "gamma",
                 "curve_points",
                 "threshold",
                 "line_interval_mm",
@@ -786,6 +844,9 @@ def _build_raster_part(
             computed_auto_levels=computed_auto_levels,
             black_point=step.black_point,
             white_point=step.white_point,
+            brightness=step.brightness,
+            contrast=step.contrast,
+            gamma=step.gamma,
             curve_points=step.curve_points,
             power_level_boundaries=_effective_power_level_boundaries(step),
             threshold=step.threshold,
@@ -850,6 +911,9 @@ def _build_raster_part(
         computed_auto_levels=computed_auto_levels,
         black_point=step.black_point,
         white_point=step.white_point,
+        brightness=step.brightness,
+        contrast=step.contrast,
+        gamma=step.gamma,
         curve_points=step.curve_points,
         threshold=step.threshold,
         dither_algorithm=step.dither_algorithm,

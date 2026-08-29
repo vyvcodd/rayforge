@@ -26,9 +26,11 @@ from rayforge.ui_gtk.shared.burn_preview_widget import BurnPreviewWidget
 
 from ..levels_range_var import LevelsRangeVar
 from ..power_curve_var import PowerCurveVar
+from ..power_level_boundaries_var import PowerLevelBoundariesVar
 from .laser_step_page import LaserStepSettingsPage
 from .levels_adapter import LevelsAdapter
 from .power_curve_adapter import PowerCurveAdapter
+from .power_level_boundaries_adapter import PowerLevelBoundariesAdapter
 from .raster_power_widget import RasterPowerWidget
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,7 @@ _POWER_KEYS = {
     "min_power_level",
     "max_power_level",
     "num_power_levels",
+    "power_level_boundaries",
 }
 
 # Target pixel resolution for the burn preview's offscreen render (see
@@ -107,6 +110,10 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                 return LevelsRangeVar(visible_when=lambda values: False)
             if v.key == "curve_points":
                 return PowerCurveVar(visible_when=lambda values: False)
+            if v.key == "power_level_boundaries":
+                return PowerLevelBoundariesVar(
+                    visible_when=lambda values: False
+                )
             return v
 
         power_vs = VarSet(
@@ -151,6 +158,14 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
         self.curve_adapter = (
             curve if isinstance(curve, PowerCurveAdapter) else None
         )
+
+        bands = self.power_widget.adapter_for("power_level_boundaries")
+        self.bands_adapter = (
+            bands if isinstance(bands, PowerLevelBoundariesAdapter) else None
+        )
+        if self.bands_adapter is not None:
+            self.bands_adapter.set_histogram_source(step)
+            GLib.idle_add(self.bands_adapter.compute_raw_samples)
 
         self._push_head_defaults()
 
@@ -333,6 +348,29 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                 curve_widget.set_content_height(140)
                 panel.append(curve_widget)
                 self.curve_adapter.set_subtitle_label(curve_subtitle)
+
+            if self.bands_adapter is not None:
+                panel.append(
+                    Gtk.Separator(margin_top=6, margin_bottom=6)
+                )
+                panel.append(
+                    Gtk.Label(
+                        label=_("Power Levels"),
+                        halign=Gtk.Align.START,
+                        css_classes=["title-4"],
+                    )
+                )
+                bands_subtitle = Gtk.Label(
+                    halign=Gtk.Align.START,
+                    css_classes=["dim-label", "caption"],
+                    wrap=True,
+                )
+                panel.append(bands_subtitle)
+                bands_widget = self.bands_adapter.detach_widget()
+                bands_widget.set_hexpand(True)
+                bands_widget.set_content_height(110)
+                panel.append(bands_widget)
+                self.bands_adapter.set_subtitle_label(bands_subtitle)
 
             # Debug toggles for the preview's own darkening effects
             # (see render_segments's docstring) -- off by default

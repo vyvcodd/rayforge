@@ -307,6 +307,7 @@ def preprocess_raster_image(
     black_point: int = 0,
     white_point: int = 255,
     curve_points: list[tuple[float, float]] | None = None,
+    power_level_boundaries: list[float] | None = None,
     threshold: int = 128,
     dither_algorithm: DitherAlgorithm | None = None,
     laser_spot_x_mm: float = 0.1,
@@ -384,6 +385,7 @@ def preprocess_raster_image(
             black_point=black_point,
             white_point=white_point,
             curve_points=curve_points,
+            power_level_boundaries=power_level_boundaries,
         )
         return gray_image, alpha
 
@@ -447,6 +449,7 @@ def preprocess_raster_image_vips(
     black_point: int = 0,
     white_point: int = 255,
     curve_points: list[tuple[float, float]] | None = None,
+    power_level_boundaries: list[float] | None = None,
     threshold: int = 128,
 ) -> tuple["pyvips.Image", "pyvips.Image | None"]:
     """Streaming equivalent of :func:`preprocess_raster_image` for the
@@ -468,6 +471,12 @@ def preprocess_raster_image_vips(
     always have a small-preview auto-levels result available (see
     ``compute_raster_auto_levels``) since that's already how the
     existing capped path keeps levels consistent across chunks.
+
+    ``power_level_boundaries``: non-uniform brightness boundaries
+    between ``num_power_levels`` power bands (see
+    :func:`_boundaries_to_lut`), applied after the curve. ``None``
+    (the default) leaves the raster assembler's own uniform
+    ``num_power_levels`` quantization as the only banding applied.
 
     Returns ``(image, alpha)`` where *image* is a single-band uchar
     vips image (grayscale for MULTI_PASS/POWER_MODULATION, binary
@@ -532,6 +541,15 @@ def preprocess_raster_image_vips(
         lut_img = pyvips.Image.new_from_array([list(lut_arr)])
         gray = gray.maplut(lut_img).cast("uchar")
 
+    if power_level_boundaries:
+        # Non-uniform power-quantization bands, applied last so the
+        # raster assembler's own num_power_levels quantization (still
+        # applied downstream, unconditionally) becomes a no-op -- see
+        # _boundaries_to_lut's docstring.
+        lut_arr = _boundaries_to_lut(power_level_boundaries)
+        lut_img = pyvips.Image.new_from_array([list(lut_arr)])
+        gray = gray.maplut(lut_img).cast("uchar")
+
     return gray, alpha
 
 
@@ -544,9 +562,10 @@ def _apply_raster_levels(
     black_point: int = 0,
     white_point: int = 255,
     curve_points: list[tuple[float, float]] | None = None,
+    power_level_boundaries: list[float] | None = None,
 ) -> np.ndarray:
     """Apply auto-levels or manual black/white-point normalization,
-    then a midtone curve.
+    then a midtone curve, then non-uniform power-level banding.
 
     This is the standalone equivalent of ``Rasterizer._apply_levels``.
     """
@@ -562,6 +581,8 @@ def _apply_raster_levels(
         gray_image = normalize_grayscale(gray_image, bp, wp)
     if curve_points and curve_points != [(0.0, 0.0), (1.0, 1.0)]:
         gray_image = _curve_to_lut(curve_points)[gray_image]
+    if power_level_boundaries:
+        gray_image = _boundaries_to_lut(power_level_boundaries)[gray_image]
     return gray_image
 
 
@@ -578,6 +599,27 @@ def _curve_to_lut(curve_points: list[tuple[float, float]]) -> np.ndarray:
     ys = np.array([p[1] for p in points]) * 255.0
     lut = np.interp(np.arange(256), xs, ys)
     return np.clip(np.round(lut), 0, 255).astype(np.uint8)
+
+
+def _boundaries_to_lut(boundaries: list[float]) -> np.ndarray:
+    """A 256-entry uint8 lookup table implementing non-uniform power
+    bands: ``len(boundaries) + 1`` bands, split at ``boundaries``
+    (0..255, strictly increasing) instead of dividing 0..255 evenly.
+
+    Each band maps to the *same* output value the raster assembler's
+    own uniform ``num_power_levels`` quantizer (see raygeo's
+    ``image::scan``) would produce for that band index at that level
+    count -- ``round(band_index * 255 / (num_bands - 1))`` -- so
+    quantizing this LUT's output again downstream is a no-op: only
+    which brightnesses land in which band changes, not what power
+    each band maps to.
+    """
+    edges = np.asarray(sorted(boundaries), dtype=np.float64)
+    num_bands = len(edges) + 1
+    xs = np.arange(256)
+    band = np.searchsorted(edges, xs, side="right")
+    lut = np.round(band * 255.0 / max(num_bands - 1, 1))
+    return np.clip(lut, 0, 255).astype(np.uint8)
 
 
 def compute_raster_auto_levels(

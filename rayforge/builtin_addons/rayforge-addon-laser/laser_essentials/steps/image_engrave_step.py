@@ -38,6 +38,7 @@ from rayforge.pipeline.transformer.registry import transformer_registry
 
 from ..levels_range_var import LevelsRangeVar
 from ..power_curve_var import PowerCurveVar
+from ..power_level_boundaries_var import PowerLevelBoundariesVar
 from ..scan_angle_var import ScanAngleVar
 from .laser_step import LaserStep
 
@@ -94,6 +95,7 @@ class ImageEngraveStep(LaserStep):
         self.min_power_level = 0.0
         self.max_power_level = 1.0
         self.num_power_levels = 25
+        self.power_level_boundaries: list[float] | None = None
         self.offset_x_mm = 0.0
         self.offset_y_mm = 0.0
         self.scan_mode = "SEGMENTED"
@@ -323,6 +325,15 @@ class ImageEngraveStep(LaserStep):
                     max_val=256,
                     visible_when=is_power,
                 ),
+                PowerLevelBoundariesVar(
+                    key="power_level_boundaries",
+                    description=_(
+                        "Drag to move where each power level starts/"
+                        "ends -- power stays evenly spaced, only the "
+                        "brightness range per level changes"
+                    ),
+                    visible_when=is_power,
+                ),
             ]
         )
 
@@ -475,6 +486,7 @@ class ImageEngraveStep(LaserStep):
                 "black_point": self.black_point,
                 "white_point": self.white_point,
                 "curve_points": self.curve_points,
+                "power_level_boundaries": self.power_level_boundaries,
                 "threshold": self.threshold,
                 "dither_algorithm": (
                     self.dither_algorithm.name
@@ -501,6 +513,7 @@ class ImageEngraveStep(LaserStep):
         result["min_power_level"] = self.min_power_level
         result["max_power_level"] = self.max_power_level
         result["num_power_levels"] = self.num_power_levels
+        result["power_level_boundaries"] = self.power_level_boundaries
         result["offset_x_mm"] = self.offset_x_mm
         result["offset_y_mm"] = self.offset_y_mm
         result["scan_mode"] = self.scan_mode
@@ -538,6 +551,10 @@ class ImageEngraveStep(LaserStep):
         step.min_power_level = data.get("min_power_level", 0.0)
         step.max_power_level = data.get("max_power_level", 1.0)
         step.num_power_levels = int(data.get("num_power_levels", 25))
+        boundaries = data.get("power_level_boundaries")
+        step.power_level_boundaries = (
+            [float(b) for b in boundaries] if boundaries else None
+        )
         step.offset_x_mm = data.get("offset_x_mm", 0.0)
         step.offset_y_mm = data.get("offset_y_mm", 0.0)
         step.scan_mode = data.get("scan_mode", "SEGMENTED")
@@ -572,6 +589,7 @@ class ImageEngraveStep(LaserStep):
                 "min_power_level",
                 "max_power_level",
                 "num_power_levels",
+                "power_level_boundaries",
                 "offset_x_mm",
                 "offset_y_mm",
                 "scan_mode",
@@ -650,6 +668,28 @@ class ImageEngraveStep(LaserStep):
                 t["distance_mm"] = auto_distance
 
         return step
+
+
+def _effective_power_level_boundaries(
+    step: ImageEngraveStep,
+) -> list[float] | None:
+    """``step.power_level_boundaries`` if it still matches
+    ``num_power_levels``, else ``None`` (falls back to the assembler's
+    own uniform division).
+
+    Only ``num_power_levels - 1`` matches the currently-configured
+    band count -- a stale list (e.g. left over after the user lowered
+    ``num_power_levels`` without re-dragging boundaries) would put more
+    boundaries than bands into :func:`_boundaries_to_lut`, silently
+    producing more (and differently-sized) bands than the level count
+    the rest of the UI shows.
+    """
+    boundaries = step.power_level_boundaries
+    if not boundaries:
+        return None
+    if len(boundaries) != step.num_power_levels - 1:
+        return None
+    return boundaries
 
 
 def _build_raster_part(
@@ -747,6 +787,7 @@ def _build_raster_part(
             black_point=step.black_point,
             white_point=step.white_point,
             curve_points=step.curve_points,
+            power_level_boundaries=_effective_power_level_boundaries(step),
             threshold=step.threshold,
         )
         # TODO(raygeo): VipsChunkSource.read_slab()/read_all() return

@@ -253,13 +253,21 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
         root = self.get_root()
         set_side_panel = getattr(root, "set_side_panel", None)
         if callable(set_side_panel):
-            panel = Gtk.Box(
+            preview_box = Gtk.Box(
                 orientation=Gtk.Orientation.VERTICAL,
                 margin_start=12,
                 margin_end=12,
                 margin_top=12,
                 margin_bottom=12,
             )
+            rest_box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                margin_start=12,
+                margin_end=12,
+                margin_top=12,
+                margin_bottom=12,
+            )
+            panel = preview_box
             header_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
             header_row.append(
                 Gtk.Label(
@@ -302,6 +310,7 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
                 )
             )
             panel.append(self.burn_preview)
+            panel = rest_box
 
             if self.levels_adapter is not None:
                 panel.append(
@@ -424,7 +433,29 @@ class ImageEngraveStepSettingsPage(LaserStepSettingsPage):
             debug_list.append(subdivide_row)
             panel.append(debug_list)
 
-            set_side_panel(panel)
+            # rest_box (Levels/Power Curve/Power Levels/debug toggles)
+            # can run long -- wrap it in its own scroller so dragging
+            # the preview larger doesn't just clip it.
+            rest_scroller = Gtk.ScrolledWindow(
+                hscrollbar_policy=Gtk.PolicyType.NEVER,
+                vexpand=True,
+            )
+            rest_scroller.set_child(rest_box)
+
+            # A vertical Paned between the preview and everything below
+            # it, so the preview's height is a plain drag instead of a
+            # fixed size -- useful when you need to see fine dot/line
+            # detail that the default height crops off.
+            vpaned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+            vpaned.set_start_child(preview_box)
+            vpaned.set_resize_start_child(True)
+            vpaned.set_shrink_start_child(True)
+            vpaned.set_end_child(rest_scroller)
+            vpaned.set_resize_end_child(True)
+            vpaned.set_shrink_end_child(True)
+            vpaned.set_position(420)
+
+            set_side_panel(vpaned)
         if isinstance(root, Gtk.Window):
             root.set_default_size(950, 700)
         return False

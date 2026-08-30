@@ -25,9 +25,36 @@ from ..structures import (
     VectorizationResult,
 )
 from .svg_base import SvgImporterBase
-from .svgutil import NO_COLOR_KEY, extract_layer_manifest
+from .svgutil import NO_COLOR_KEY, dedupe_layer_ids, extract_layer_manifest
 
 logger = logging.getLogger(__name__)
+
+
+def _dedupe_layer_ids(
+    layers_raw: list[tuple[str, Geometry]],
+) -> list[tuple[str, Geometry]]:
+    """Disambiguate duplicate layer ids from raygeo's per-layer output.
+
+    ``_layer_geometries_by_svg`` builds a *list* entry per (layer_id,
+    geo) pair -- duplicates included -- but ``vectorize()`` keys its
+    geometry lookup by layer_id in a plain dict, so a repeated id would
+    otherwise make every occurrence after the first silently overwrite
+    the previous one's geometry: multiple doc items still get created
+    (one per list entry, each with its own position), but they'd all
+    render whichever occurrence came last.
+
+    Delegates the actual disambiguation to
+    ``svgutil.dedupe_layer_ids`` -- see its docstring -- so this and
+    ``extract_layer_manifest``'s manifest (built independently, via a
+    separate Python XML scan rather than raygeo) agree on ids for the
+    same document.
+    """
+    raw_ids = [raw_id for raw_id, _ in layers_raw]
+    deduped_ids = dedupe_layer_ids(raw_ids)
+    return [
+        (deduped_id, geo)
+        for deduped_id, (_, geo) in zip(deduped_ids, layers_raw)
+    ]
 
 
 class SvgVectorImporter(SvgImporterBase):
@@ -140,7 +167,9 @@ class SvgVectorImporter(SvgImporterBase):
                     geometries_by_layer[color_key] = geo
         else:
             # Extract per-layer geometries via raygeo (already in user space).
-            layers_raw = svg_string_to_geometry_by_layer(svg_str, 1.0, 1.0)
+            layers_raw = _dedupe_layer_ids(
+                svg_string_to_geometry_by_layer(svg_str, 1.0, 1.0)
+            )
             for layer_id, geo in layers_raw:
                 if layer_id in target_layer_ids and not geo.is_empty():
                     geometries_by_layer[layer_id] = geo
@@ -166,7 +195,9 @@ class SvgVectorImporter(SvgImporterBase):
 
     def _layer_geometries_by_svg(self, svg_str: str) -> list[LayerGeometry]:
         """Builds LayerGeometry entries from top-level SVG layer groups."""
-        layers_raw = svg_string_to_geometry_by_layer(svg_str, 1.0, 1.0)
+        layers_raw = _dedupe_layer_ids(
+            svg_string_to_geometry_by_layer(svg_str, 1.0, 1.0)
+        )
         assert self.trimmed_data is not None
         layer_manifest = extract_layer_manifest(self.trimmed_data)
         layer_names_by_id = {
@@ -176,7 +207,15 @@ class SvgVectorImporter(SvgImporterBase):
         layer_geometries: list[LayerGeometry] = []
         for layer_id, geo in layers_raw:
             if not geo.is_empty():
-                layer_name = layer_names_by_id.get(layer_id, layer_id)
+                # layer_names_by_id is keyed by the raw (pre-dedupe) id
+                # from the manifest scan, so look up by that -- then
+                # carry the disambiguating suffix, if any, into the
+                # display name too instead of showing it the raw
+                # "id#2" form.
+                base_id, _, suffix = layer_id.partition("#")
+                layer_name = layer_names_by_id.get(base_id, base_id)
+                if suffix:
+                    layer_name = f"{layer_name} ({suffix})"
                 layer_geometries.append(
                     self._layer_geometry(layer_id, layer_name, geo)
                 )

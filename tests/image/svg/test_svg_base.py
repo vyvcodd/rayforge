@@ -78,6 +78,56 @@ def test_scan_finds_valid_layers():
     assert not manifest.warnings
 
 
+SVG_DUPLICATE_LAYER_IDS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<svg width="100mm" height="100mm" viewBox="0 0 100 100"
+     xmlns="http://www.w3.org/2000/svg">
+  <g id="layer1"><rect x="0" y="0" width="10" height="10" /></g>
+  <g id="layer1"><rect x="50" y="50" width="10" height="10" /></g>
+</svg>
+"""
+
+SVG_NESTED_LAYER_GROUPS = b"""<?xml version="1.0" encoding="UTF-8"?>
+<svg width="100mm" height="100mm" viewBox="0 0 100 100"
+     xmlns="http://www.w3.org/2000/svg">
+  <g id="outer">
+    <g id="layer1"><rect x="0" y="0" width="10" height="10" /></g>
+    <g id="layer2"><rect x="50" y="50" width="10" height="10" /></g>
+  </g>
+</svg>
+"""
+
+
+def test_scan_disambiguates_duplicate_layer_ids():
+    """Two top-level groups sharing the same id must both survive as
+    distinct, independently addressable layers instead of one silently
+    colliding with the other downstream (see svgutil.dedupe_layer_ids)."""
+    importer = ConcreteSvgImporter(
+        SVG_DUPLICATE_LAYER_IDS, Path("dup.svg")
+    )
+    manifest = importer.scan()
+
+    assert len(manifest.layers) == 2
+    ids = [layer.id for layer in manifest.layers]
+    assert ids == ["layer1", "layer1#2"]
+    assert len(set(ids)) == 2
+    assert manifest.layers[1].name == "layer1 (2)"
+
+
+def test_scan_splits_layers_nested_in_wrapper_group():
+    """Layers re-grouped under an outer id-bearing wrapper (e.g. an
+    editor's "group selected layers", or a viewport/clip wrapper some
+    export tools add) must stay separate rather than collapsing into
+    one layer under the wrapper's own id."""
+    importer = ConcreteSvgImporter(
+        SVG_NESTED_LAYER_GROUPS, Path("nested.svg")
+    )
+    manifest = importer.scan()
+
+    assert len(manifest.layers) == 2
+    ids = [layer.id for layer in manifest.layers]
+    assert ids == ["layer1", "layer2"]
+
+
 def test_scan_no_layers_structure():
     """Test scanning a simple SVG with no explicit layer groups."""
     importer = ConcreteSvgImporter(SVG_NO_LAYERS, Path("simple.svg"))

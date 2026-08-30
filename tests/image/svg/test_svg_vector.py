@@ -155,24 +155,24 @@ SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER = f"""
 """.encode()
 
 
-def test_raster_only_layer_selected_alone_yields_no_geometry():
+def test_raster_only_layer_selected_alone_imports_the_image():
     """A layer containing only a raster <image> (no vector paths) has
-    nothing for this vector-only strategy to extract. Selecting *only*
-    that layer must import nothing, not silently substitute some other
-    layer's geometry.
+    nothing for this vector-only strategy to extract as *vector*
+    geometry, but the embedded image itself must still be imported as
+    a real raster WorkPiece -- selecting *only* that layer must not
+    silently substitute some other layer's geometry, nor drop the
+    image on the floor.
 
-    Two separate fallback-on-empty-selection bugs previously combined
-    to cause exactly that: vectorize()'s "no layers found, parse the
-    whole SVG" fallback triggered whenever the post-selection geometry
-    dict was empty (true whenever the sole selected layer is
-    raster-only, not just when the document has no layers at all), and
-    even after fixing that, NormalizationEngine.calculate_layout()'s
-    "no matching layers, fall back to page bounds" had the identical
-    bug one layer up -- "logo" never appears in parse_result.layers at
-    all (svg_vector.py only adds layers with non-empty geometry), so
-    the active_layer_ids filter matched nothing there too, and the
-    page-bounds fallback covered the *whole document* (i.e. "outline"'s
-    content, which was never selected)."""
+    Historically this layer produced zero items: two fallback-on-
+    empty-selection bugs (vectorize()'s "no layers found, parse the
+    whole SVG" fallback, and NormalizationEngine.calculate_layout()'s
+    "no matching layers, fall back to page bounds" one layer up) meant
+    selecting it substituted the *other* layer's content instead; once
+    those were fixed it correctly produced nothing, but "nothing" was
+    still wrong -- the real bug was that embedded images were never
+    extracted at all. _post_process_payload (via
+    SvgVectorImporter._extract_embedded_images/_build_image_item) now
+    splices them in as their own WorkPiece."""
     importer = SvgVectorImporter(
         SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER, Path("mixed.svg")
     )
@@ -188,12 +188,20 @@ def test_raster_only_layer_selected_alone_yields_no_geometry():
     import_result = importer.get_doc_items(vectorization_spec=spec)
     payload = import_result.payload
 
-    assert len(payload.items) == 0
+    assert len(payload.items) == 1
+    assert len(payload.assets) == 1
+    layer = payload.items[0]
+    assert isinstance(layer, Layer)
+    assert layer.name == "logo"
+    wp = next(c for c in layer.children if isinstance(c, WorkPiece))
+    assert wp.natural_width_mm == pytest.approx(10.0, abs=1e-3)
+    assert wp.natural_height_mm == pytest.approx(10.0, abs=1e-3)
 
 
 def test_selecting_both_layers_still_imports_the_vector_one():
     """The vector layer must still import correctly when selected
-    alongside a raster-only layer that contributes nothing."""
+    alongside a raster-only layer -- and the raster layer's embedded
+    image must also come through as its own item."""
     importer = SvgVectorImporter(
         SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER, Path("mixed.svg")
     )
@@ -207,6 +215,7 @@ def test_selecting_both_layers_still_imports_the_vector_one():
     import_result = importer.get_doc_items(vectorization_spec=spec)
     payload = import_result.payload
 
+    assert len(payload.items) == 2
     sizes = []
     for item in payload.items:
         wps = [c for c in item.children if isinstance(c, WorkPiece)]
@@ -217,6 +226,7 @@ def test_selecting_both_layers_still_imports_the_vector_one():
                 (round(wp.natural_width_mm), round(wp.natural_height_mm))
             )
     assert (20, 10) in sizes
+    assert (10, 10) in sizes
 
 
 SVG_DUPLICATE_IDS = b"""
@@ -542,3 +552,119 @@ def test_any_mode_uses_stroke_color_by_default():
     assert payload is not None
     by_name = {item.name: item for item in payload.items}
     assert set(by_name) == {"Color #0000ff", "Color #00ff00"}
+
+
+SVG_ROTATED_IMAGE = f"""
+<svg width="100mm" height="100mm" viewBox="0 0 100 100"
+     xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <g id="logo"><image x="0" y="0" width="10" height="20"
+        transform="rotate(90)"
+        xlink:href="{_TINY_PNG_DATA_URI}"/></g>
+</svg>
+""".encode()
+
+
+def test_rotated_embedded_image_placement():
+    """A transform="rotate(...)" on an embedded <image> must produce a
+    rotation-capable WorkPiece matrix (not just an axis-aligned
+    scale+translate) whose four corners land exactly where the SVG
+    transform places them in World mm."""
+    importer = SvgVectorImporter(SVG_ROTATED_IMAGE, Path("rotated.svg"))
+    manifest = importer.scan()
+    logo_id = next(
+        layer.id for layer in manifest.layers if layer.name == "logo"
+    )
+    spec = PassthroughSpec(
+        active_layer_ids=[logo_id],
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(spec)
+    payload = import_result.payload
+    assert len(payload.items) == 1
+    layer = payload.items[0]
+    assert isinstance(layer, Layer)
+    wp = next(c for c in layer.children if isinstance(c, WorkPiece))
+
+    # rotate(90) swaps which native axis maps to width vs. height, so
+    # natural size following the transform is (10, 20), not (20, 10).
+    assert wp.natural_width_mm == pytest.approx(10.0, abs=1e-3)
+    assert wp.natural_height_mm == pytest.approx(20.0, abs=1e-3)
+
+    # Unit-square corners, mapped through the WorkPiece matrix, must
+    # land on the exact rotated placement in World mm (viewBox is
+    # 100x100 at unit_to_mm=1.0, untouched by trimming since the
+    # trimmer only considers vector geometry and this document has
+    # none).
+    bl = wp.matrix.transform_point((0, 0))
+    br = wp.matrix.transform_point((1, 0))
+    tl = wp.matrix.transform_point((0, 1))
+    assert bl == pytest.approx((-20.0, 100.0), abs=1e-3)
+    assert br == pytest.approx((-20.0, 90.0), abs=1e-3)
+    assert tl == pytest.approx((0.0, 100.0), abs=1e-3)
+
+
+def test_flatten_mode_does_not_wrap_image_in_layer():
+    """LayerImportMode.FLATTEN must yield a bare WorkPiece for an
+    embedded image, matching how it treats vector layers."""
+    importer = SvgVectorImporter(
+        SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER, Path("mixed.svg")
+    )
+    manifest = importer.scan()
+    logo_id = next(
+        layer.id for layer in manifest.layers if layer.name == "logo"
+    )
+    spec = PassthroughSpec(
+        active_layer_ids=[logo_id],
+        layer_import_mode=LayerImportMode.FLATTEN,
+    )
+    import_result = importer.get_doc_items(spec)
+    payload = import_result.payload
+    assert len(payload.items) == 1
+    assert isinstance(payload.items[0], WorkPiece)
+
+
+def test_color_layer_mode_does_not_extract_images():
+    """Embedded images have no associated fill/stroke color, so
+    color-bucket layer mode must not extract them (avoiding a
+    duplicate import of content the color mode has no slot for)."""
+    importer = SvgVectorImporter(
+        SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER, Path("mixed.svg")
+    )
+    spec = PassthroughSpec(
+        layer_source=LayerSource.COLORS,
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(spec)
+    payload = import_result.payload
+    assert payload.assets == []
+
+
+SVG_EXTERNAL_IMAGE_REF = b"""
+<svg width="100mm" height="100mm" viewBox="0 0 100 100"
+     xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <g id="logo"><image x="0" y="0" width="10" height="10"
+        xlink:href="not-a-data-uri.png"/></g>
+</svg>
+"""
+
+
+def test_external_image_href_warns_and_is_skipped():
+    """Only embedded (base64 data URI) images are supported -- an
+    external file reference must not crash the import, and should
+    surface as a warning rather than being silently dropped."""
+    importer = SvgVectorImporter(
+        SVG_EXTERNAL_IMAGE_REF, Path("external.svg")
+    )
+    manifest = importer.scan()
+    logo_id = next(
+        layer.id for layer in manifest.layers if layer.name == "logo"
+    )
+    spec = PassthroughSpec(
+        active_layer_ids=[logo_id],
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(spec)
+    payload = import_result.payload
+    assert payload.items == []
+    assert payload.assets == []
+    assert len(import_result.warnings) == 1

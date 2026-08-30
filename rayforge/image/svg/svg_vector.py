@@ -157,10 +157,23 @@ class SvgVectorImporter(SvgImporterBase):
         )
 
         geometries_by_layer: dict[str | None, Geometry] = {}
+        # Whether raygeo found *any* layer-structured geometry anywhere
+        # in the document, before filtering down to target_layer_ids --
+        # distinct from geometries_by_layer ending up empty, which can
+        # also happen when every *selected* layer is legitimately
+        # geometry-less (e.g. a layer holding only a raster <image>,
+        # which this vector-only strategy can't extract paths from).
+        # Falling back to "parse the whole SVG" on that second
+        # condition instead of the first ignores the selection
+        # entirely and silently substitutes other layers' content.
+        document_has_layer_geometry = False
         if spec.layer_source == LayerSource.COLORS:
             # Extract one merged geometry per resolved color.
             buckets_raw = svg_string_to_geometry_by_color(
                 svg_str, 1.0, 1.0, spec.color_attr
+            )
+            document_has_layer_geometry = any(
+                not geo.is_empty() for _, geo in buckets_raw
             )
             for color_key, geo in buckets_raw:
                 if color_key in target_layer_ids and not geo.is_empty():
@@ -170,12 +183,19 @@ class SvgVectorImporter(SvgImporterBase):
             layers_raw = _dedupe_layer_ids(
                 svg_string_to_geometry_by_layer(svg_str, 1.0, 1.0)
             )
+            document_has_layer_geometry = any(
+                not geo.is_empty() for _, geo in layers_raw
+            )
             for layer_id, geo in layers_raw:
                 if layer_id in target_layer_ids and not geo.is_empty():
                     geometries_by_layer[layer_id] = geo
 
-        # If no layers found, fall back to the whole SVG.
-        if not geometries_by_layer:
+        # Only fall back to "parse the whole SVG" when the document has
+        # no layer structure at all (e.g. a flat SVG with no <g id>
+        # groups). If it does have layers but none of the *selected*
+        # ones produced geometry, leave geometries_by_layer empty
+        # rather than substituting unrelated layers' content.
+        if not geometries_by_layer and not document_has_layer_geometry:
             logger.debug(
                 "No layer-specific geometry found, parsing entire SVG as "
                 "default."

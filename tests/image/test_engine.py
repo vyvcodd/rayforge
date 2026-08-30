@@ -226,3 +226,49 @@ def test_empty_content_fallback(engine):
     item = plan[0]
     # Should match page bounds
     assert item.crop_window == (0, 0, 100, 100)
+
+
+def test_selection_matching_no_layer_returns_empty_not_page_bounds(engine):
+    """
+    A real bug: the document has a layer ("A") with real geometry, but
+    the caller's explicit active_layer_ids selects a layer id that
+    isn't in result.layers at all -- e.g. a raster-only SVG layer,
+    which svg_vector.py never adds to parse_result.layers because it
+    has no vector geometry to extract. This must return an empty plan,
+    not silently substitute the whole page/document bounds (which
+    would include "A"'s content the caller never selected).
+    """
+    vec_result = create_vec_result(
+        document_bounds=(0, 0, 100, 100),
+        layers=[("A", (10, 10, 10, 10))],
+    )
+
+    spec = PassthroughSpec(
+        active_layer_ids=["raster_only_layer"],
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    plan = engine.calculate_layout(vec_result, spec)
+
+    assert plan == []
+
+
+def test_explicitly_empty_selection_returns_empty_not_everything(engine):
+    """
+    An explicit empty selection (e.g. every layer checkbox unticked in
+    the import dialog) must import nothing -- not fall back to "no
+    filter given" behavior, which would import every layer regardless
+    of the user's choice. active_layer_ids=[] and =None must not be
+    treated the same.
+    """
+    vec_result = create_vec_result(
+        document_bounds=(0, 0, 100, 100),
+        layers=[("A", (10, 10, 10, 10)), ("B", (20, 20, 10, 10))],
+    )
+
+    spec = PassthroughSpec(
+        active_layer_ids=[],
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    plan = engine.calculate_layout(vec_result, spec)
+
+    assert plan == []

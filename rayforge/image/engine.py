@@ -247,22 +247,40 @@ class NormalizationEngine:
         # For direct vector imports (PassthroughSpec), bounds from parse phase
         # are authoritative.
         split_layers = False
-        active_layers = None
+        # None means "no filter given" (e.g. a programmatic caller that
+        # never set active_layer_ids); an explicit list -- even an empty
+        # one, e.g. every checkbox unticked -- means the caller made a
+        # real selection, which must be respected even when it matches
+        # nothing. `is not None`, not truthiness, is what distinguishes
+        # these two: PassthroughSpec.active_layer_ids defaults to None.
+        active_layers: set[str] | None = None
         if isinstance(spec, PassthroughSpec):
             split_layers = spec.layer_import_mode != LayerImportMode.FLATTEN
-            if spec.active_layer_ids:
+            if spec.active_layer_ids is not None:
                 active_layers = set(spec.active_layer_ids)
 
         # Filter relevant layers
         target_layers: list[LayerGeometry] = result.layers
-        if active_layers:
+        if active_layers is not None:
             target_layers = [
                 geo for geo in result.layers if geo.layer_id in active_layers
             ]
 
         if not target_layers:
-            # Fallback for empty files or no matching layers: use page bounds.
-            # But if page bounds are effectively zero-sized, return empty plan.
+            if active_layers is not None:
+                # An explicit selection was made (possibly empty), and it
+                # matched no layer with real geometry -- e.g. every
+                # selected layer is raster-only, with no vector content
+                # for this importer to extract, or nothing was selected
+                # at all. Return an empty plan rather than substituting
+                # the whole document's other, unselected layers -- see
+                # svg_vector.vectorize()'s document_has_layer_geometry
+                # guard for the sibling fix this mirrors.
+                return []
+            # No selection filter was given at all, and the document has
+            # no layer structure either (e.g. a flat SVG with no <g id>
+            # groups) -- fall back to page bounds. If page bounds are
+            # effectively zero-sized, return an empty plan instead.
             _bx, _by, bw, bh = result.document_bounds
             if bw <= 1e-6 or bh <= 1e-6:
                 return []

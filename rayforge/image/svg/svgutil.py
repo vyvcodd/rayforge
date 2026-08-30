@@ -344,6 +344,67 @@ def extract_color_manifest(
     return layers
 
 
+def _is_id_bearing_group(element: ET.Element) -> bool:
+    return _get_local_tag_name(element) == "g" and bool(element.get("id"))
+
+
+def _has_nested_layer_group(element: ET.Element) -> bool:
+    """True if `element` has other id-bearing `<g>` elements directly
+    inside it -- see `_collect_layer_elements`'s docstring."""
+    return any(_is_id_bearing_group(child) for child in element)
+
+
+def _collect_layer_elements(root: ET.Element) -> list[ET.Element]:
+    """Recursively find the `<g id>` elements that should each become
+    their own layer, treating an id-bearing group as a pass-through
+    wrapper -- recursing into it instead of stopping there -- whenever
+    it directly contains other id-bearing `<g>` children (re-grouped
+    layers, a viewport/clip wrapper some export tools add per layer,
+    etc.), rather than merging its whole subtree under the wrapper's
+    own id.
+
+    Mirrors raygeo's `collect_layer_nodes` (src/svg/mod.rs) exactly, so
+    this manifest's ids -- used to build `active_layer_ids` for
+    filtering -- line up 1:1 with what the actual geometry extraction
+    (raygeo, layer-aware) finds. A mismatch here would silently filter
+    out layers that raygeo does find, since layer_id membership is
+    tested by exact string match.
+    """
+    result: list[ET.Element] = []
+    for child in root:
+        if not _is_id_bearing_group(child):
+            continue
+        if _has_nested_layer_group(child):
+            result.extend(_collect_layer_elements(child))
+        else:
+            result.append(child)
+    return result
+
+
+def dedupe_layer_ids(raw_ids: list[str]) -> list[str]:
+    """Disambiguate duplicate ids by appending a "#2", "#3", ...
+    suffix to every occurrence after the first.
+
+    SVG doesn't guarantee unique ids across a document -- hand-edited
+    files, or files produced by merging/re-exporting, routinely repeat
+    ids like "layer1". Downstream code (both this manifest and
+    ``svg_vector._dedupe_layer_ids``) uses layer_id as a dict key, so a
+    repeated id would otherwise make every occurrence after the first
+    silently collide with/overwrite the previous one. Shared between
+    the manifest (this module) and the actual geometry extraction
+    (``svg_vector.py``) so a duplicate id resolves to the same
+    disambiguated key in both -- they call this on the same ids in the
+    same document order, since both derive from the same parsed SVG.
+    """
+    seen: dict[str, int] = {}
+    result = []
+    for raw_id in raw_ids:
+        seen[raw_id] = seen.get(raw_id, 0) + 1
+        n = seen[raw_id]
+        result.append(raw_id if n == 1 else f"{raw_id}#{n}")
+    return result
+
+
 def extract_layer_manifest(data: bytes) -> list[dict[str, Any]]:
     """
     Parses the SVG to find top-level groups with IDs, treating them as layers.
@@ -356,30 +417,38 @@ def extract_layer_manifest(data: bytes) -> list[dict[str, Any]]:
     logger.debug("--- Starting SVG Layer Extraction ---")
     try:
         root = ET.fromstring(data)
-        for child in root:
-            tag = _get_local_tag_name(child)
-            layer_id = child.get("id")
+        layer_elements = _collect_layer_elements(root)
+        deduped_ids = dedupe_layer_ids(
+            [el.get("id", "") for el in layer_elements]
+        )
+        for element, layer_id in zip(layer_elements, deduped_ids):
+            raw_id = element.get("id")
+            label = element.get(f"{{{INKSCAPE_NS}}}label") or raw_id
+            if layer_id != raw_id:
+                # Disambiguated (duplicate raw id) -- carry the "#2"
+                # suffix into the displayed name too, so the import
+                # dialog's layer list doesn't show two identical-
+                # looking, unexplained entries.
+                suffix = layer_id.rsplit("#", 1)[-1]
+                label = f"{label} ({suffix})"
 
-            if tag == "g" and layer_id:
-                label = child.get(f"{{{INKSCAPE_NS}}}label") or layer_id
+            # Count visual elements recursively to detect empty layers
+            feature_count = 0
+            for elem in element.iter():
+                if _get_local_tag_name(elem) in SHAPE_TAGS:
+                    feature_count += 1
 
-                # Count visual elements recursively to detect empty layers
-                feature_count = 0
-                for elem in child.iter():
-                    if _get_local_tag_name(elem) in SHAPE_TAGS:
-                        feature_count += 1
-
-                layers.append(
-                    {
-                        "id": layer_id,
-                        "name": label,
-                        "count": feature_count,
-                    }
-                )
-                logger.debug(
-                    f"Found layer: ID='{layer_id}', "
-                    f"Name='{label}', Count={feature_count}"
-                )
+            layers.append(
+                {
+                    "id": layer_id,
+                    "name": label,
+                    "count": feature_count,
+                }
+            )
+            logger.debug(
+                f"Found layer: ID='{layer_id}', "
+                f"Name='{label}', Count={feature_count}"
+            )
     except ET.ParseError as e:
         logger.error(f"Failed to parse SVG for layer extraction: {e}")
         return []

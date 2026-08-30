@@ -136,6 +136,167 @@ def test_layer_separation_and_positioning():
     assert wy2 == pytest.approx(0.0, abs=1e-4)
 
 
+# A minimal 1x1 transparent PNG, base64-encoded -- stands in for a real
+# raster <image>, matching a layer whose only content is an embedded
+# bitmap (e.g. a logo photo/scan) rather than any vector path.
+_TINY_PNG_DATA_URI = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk"
+    "+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER = f"""
+<svg width="100mm" height="100mm" viewBox="0 0 100 100"
+     xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+    <g id="outline"><rect x="10" y="10" width="20" height="10"/></g>
+    <g id="logo"><image x="0" y="0" width="10" height="10"
+        xlink:href="{_TINY_PNG_DATA_URI}"/></g>
+</svg>
+""".encode()
+
+
+def test_raster_only_layer_selected_alone_yields_no_geometry():
+    """A layer containing only a raster <image> (no vector paths) has
+    nothing for this vector-only strategy to extract. Selecting *only*
+    that layer must not fall back to substituting some other layer's
+    geometry -- it previously did, because the fallback triggered
+    whenever the post-selection geometry dict was empty, which is also
+    exactly what happens when the sole selected layer is raster-only."""
+    importer = SvgVectorImporter(
+        SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER, Path("mixed.svg")
+    )
+    manifest = importer.scan()
+    logo_id = next(
+        layer.id for layer in manifest.layers if layer.name == "logo"
+    )
+
+    spec = PassthroughSpec(
+        active_layer_ids=[logo_id],
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(vectorization_spec=spec)
+    payload = import_result.payload
+
+    for item in payload.items:
+        wps = [c for c in item.children if isinstance(c, WorkPiece)]
+        if isinstance(item, WorkPiece):
+            wps.append(item)
+        for wp in wps:
+            # Must not have picked up "outline"'s rectangle -- either
+            # no geometry at all, or (if some fallback size is still
+            # assigned) certainly not outline's 20x10 shape.
+            assert (wp.natural_width_mm, wp.natural_height_mm) != (
+                20.0,
+                10.0,
+            )
+
+
+def test_selecting_both_layers_still_imports_the_vector_one():
+    """The vector layer must still import correctly when selected
+    alongside a raster-only layer that contributes nothing."""
+    importer = SvgVectorImporter(
+        SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER, Path("mixed.svg")
+    )
+    manifest = importer.scan()
+    layer_ids = [layer.id for layer in manifest.layers]
+
+    spec = PassthroughSpec(
+        active_layer_ids=layer_ids,
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(vectorization_spec=spec)
+    payload = import_result.payload
+
+    sizes = []
+    for item in payload.items:
+        wps = [c for c in item.children if isinstance(c, WorkPiece)]
+        if isinstance(item, WorkPiece):
+            wps.append(item)
+        for wp in wps:
+            sizes.append(
+                (round(wp.natural_width_mm), round(wp.natural_height_mm))
+            )
+    assert (20, 10) in sizes
+
+
+SVG_DUPLICATE_IDS = b"""
+<svg width="100mm" height="100mm" viewBox="0 0 100 100"
+     xmlns="http://www.w3.org/2000/svg">
+    <g id="g1"><rect x="0" y="0" width="10" height="10"/></g>
+    <g id="g1"><rect x="50" y="50" width="5" height="20"/></g>
+</svg>
+"""
+
+SVG_NESTED_LAYERS = b"""
+<svg width="100mm" height="100mm" viewBox="0 0 100 100"
+     xmlns="http://www.w3.org/2000/svg">
+    <g id="outer">
+        <g id="layer1"><rect x="0" y="0" width="10" height="10"/></g>
+        <g id="layer2"><rect x="50" y="50" width="5" height="20"/></g>
+    </g>
+</svg>
+"""
+
+
+def test_duplicate_layer_ids_keep_independent_geometry():
+    """Two top-level groups sharing the same id must each keep their
+    own geometry -- previously, vectorize() keyed its geometry lookup
+    by the raw (colliding) id in a plain dict, so both doc items ended
+    up rendering whichever occurrence's geometry came last, even
+    though each got its own correctly-positioned item."""
+    importer = SvgVectorImporter(SVG_DUPLICATE_IDS, Path("dup.svg"))
+    manifest = importer.scan()
+    layer_ids = [layer.id for layer in manifest.layers]
+    assert len(layer_ids) == 2
+    assert len(set(layer_ids)) == 2  # disambiguated, not both "g1"
+
+    spec = PassthroughSpec(
+        active_layer_ids=layer_ids,
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(vectorization_spec=spec)
+    payload = import_result.payload
+    assert len(payload.items) == 2
+
+    sizes = set()
+    for item in payload.items:
+        wp = next(c for c in item.children if isinstance(c, WorkPiece))
+        sizes.add(
+            (round(wp.natural_width_mm), round(wp.natural_height_mm))
+        )
+    # The two rects are 10x10 and 5x20 -- both distinct shapes must
+    # survive. If the dedup bug were present, both items would report
+    # whichever rect's geometry happened to be looked up last.
+    assert sizes == {(10, 10), (5, 20)}
+
+
+def test_layers_nested_in_wrapper_group_import_separately():
+    """Layers re-grouped under an outer id-bearing wrapper must still
+    import as separate items, not collapse into one merged layer under
+    the wrapper's own id."""
+    importer = SvgVectorImporter(SVG_NESTED_LAYERS, Path("nested.svg"))
+    manifest = importer.scan()
+    layer_ids = [layer.id for layer in manifest.layers]
+    assert layer_ids == ["layer1", "layer2"]
+
+    spec = PassthroughSpec(
+        active_layer_ids=layer_ids,
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(vectorization_spec=spec)
+    payload = import_result.payload
+    assert len(payload.items) == 2
+
+    sizes = {}
+    for item in payload.items:
+        wp = next(c for c in item.children if isinstance(c, WorkPiece))
+        sizes[item.name] = (
+            round(wp.natural_width_mm),
+            round(wp.natural_height_mm),
+        )
+    assert sizes == {"layer1": (10, 10), "layer2": (5, 20)}
+
+
 def test_nested_transforms_applied():
     """Test that group transforms are applied to the geometry."""
     importer = SvgVectorImporter(SVG_TRANSFORM, Path("trans.svg"))

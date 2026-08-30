@@ -383,8 +383,17 @@ class Importer(ABC):
         plan = engine.calculate_layout(vec_result, spec)
 
         if not plan:
+            # Still route through _post_process_payload: a subclass may
+            # have content to contribute independently of the vector
+            # layout plan being empty (e.g. SvgVectorImporter injecting
+            # a raster workpiece for a layer whose only content is an
+            # embedded <image>, which legitimately produces no vector
+            # geometry/layout item of its own).
+            empty_payload = self._post_process_payload(
+                ImportPayload(source=source_asset, items=[])
+            )
             return ImportResult(
-                payload=ImportPayload(source=source_asset, items=[]),
+                payload=empty_payload,
                 parse_result=parse_result,
                 vectorization_result=vec_result,
                 warnings=self._warnings,

@@ -158,10 +158,21 @@ SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER = f"""
 def test_raster_only_layer_selected_alone_yields_no_geometry():
     """A layer containing only a raster <image> (no vector paths) has
     nothing for this vector-only strategy to extract. Selecting *only*
-    that layer must not fall back to substituting some other layer's
-    geometry -- it previously did, because the fallback triggered
-    whenever the post-selection geometry dict was empty, which is also
-    exactly what happens when the sole selected layer is raster-only."""
+    that layer must import nothing, not silently substitute some other
+    layer's geometry.
+
+    Two separate fallback-on-empty-selection bugs previously combined
+    to cause exactly that: vectorize()'s "no layers found, parse the
+    whole SVG" fallback triggered whenever the post-selection geometry
+    dict was empty (true whenever the sole selected layer is
+    raster-only, not just when the document has no layers at all), and
+    even after fixing that, NormalizationEngine.calculate_layout()'s
+    "no matching layers, fall back to page bounds" had the identical
+    bug one layer up -- "logo" never appears in parse_result.layers at
+    all (svg_vector.py only adds layers with non-empty geometry), so
+    the active_layer_ids filter matched nothing there too, and the
+    page-bounds fallback covered the *whole document* (i.e. "outline"'s
+    content, which was never selected)."""
     importer = SvgVectorImporter(
         SVG_VECTOR_LAYER_PLUS_RASTER_ONLY_LAYER, Path("mixed.svg")
     )
@@ -177,18 +188,7 @@ def test_raster_only_layer_selected_alone_yields_no_geometry():
     import_result = importer.get_doc_items(vectorization_spec=spec)
     payload = import_result.payload
 
-    for item in payload.items:
-        wps = [c for c in item.children if isinstance(c, WorkPiece)]
-        if isinstance(item, WorkPiece):
-            wps.append(item)
-        for wp in wps:
-            # Must not have picked up "outline"'s rectangle -- either
-            # no geometry at all, or (if some fallback size is still
-            # assigned) certainly not outline's 20x10 shape.
-            assert (wp.natural_width_mm, wp.natural_height_mm) != (
-                20.0,
-                10.0,
-            )
+    assert len(payload.items) == 0
 
 
 def test_selecting_both_layers_still_imports_the_vector_one():
@@ -465,6 +465,27 @@ def test_facade_default_spec_merges():
     payload = import_result.payload
     assert payload is not None
     assert len(payload.items) == 1
+
+
+def test_facade_explicit_empty_selection_imports_nothing():
+    """An explicit empty active_layer_ids (e.g. every layer checkbox
+    unticked in the import dialog) must import nothing -- unlike
+    active_layer_ids=None (test_facade_default_spec_merges), which
+    means "no filter given" and correctly falls back to importing
+    everything. The facade previously used truthiness
+    (`not active_layer_ids`) to decide when to auto-populate all
+    layers, which conflated these two distinct cases."""
+    importer = SvgImporter(SVG_COLORS, Path("colors.svg"))
+    spec = PassthroughSpec(
+        active_layer_ids=[],
+        layer_source=LayerSource.COLORS,
+        layer_import_mode=LayerImportMode.NEW_LAYERS,
+    )
+    import_result = importer.get_doc_items(spec)
+    assert import_result is not None
+    payload = import_result.payload
+    assert payload is not None
+    assert len(payload.items) == 0
 
 
 def test_any_mode_splits_fill_and_stroke():

@@ -64,11 +64,15 @@ class SvgImporter(Importer):
             delegate = SvgTraceImporter(self.raw_data, self.source_file)
         else:
             # This is the direct vector import path.
-            # If no layers are specified (e.g. from CLI), assume the user wants
-            # all layers imported into the current document layer.
+            # If no layers are specified at all (e.g. from CLI), assume
+            # the user wants all layers imported into the current
+            # document layer. `is None`, not truthiness: an explicit
+            # empty list means the caller (e.g. the import dialog with
+            # every checkbox unticked) selected nothing on purpose, and
+            # that must not be treated the same as "no filter given".
             if (
                 isinstance(spec_to_use, PassthroughSpec)
-                and not spec_to_use.active_layer_ids
+                and spec_to_use.active_layer_ids is None
             ):
                 logger.debug(
                     "Empty PassthroughSpec detected in facade. "

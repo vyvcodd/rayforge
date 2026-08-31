@@ -727,7 +727,19 @@ class EngraveStep(LaserStep):
         assert Optimize is not None
         assert MultiPassTransformer is not None
         assert BidirScanOffsetTransformer is not None
-        optimize_dict = Optimize().to_dict()
+        # allow_flip=False: Optimize runs (Phase::GeometryRefinement)
+        # before BidirScanOffsetTransformer (Phase::PostProcessing)
+        # regardless of this list's order -- phase always wins over
+        # list position. With flip allowed, a row split into disjoint
+        # runs by a hole/gap in the content can have its two halves
+        # independently reversed for travel efficiency, decoupling
+        # them from the row's one true mechanical scan direction; a
+        # bidir offset classification made afterward then sees two
+        # "different directions" for what is physically one pass,
+        # correcting one half and not the other. Reordering runs for
+        # travel is still fine -- only flipping an individual run's
+        # own recorded direction breaks bidir's assumption.
+        optimize_dict = Optimize(allow_flip=False).to_dict()
         return [
             CropTransformer(enabled=False).to_dict(),
             OverscanTransformer(

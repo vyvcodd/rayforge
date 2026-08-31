@@ -76,6 +76,34 @@ class TestEngraveStep:
         )
         assert optimizer.to_dict()["merge_scanlines"] is True
 
+    def test_default_optimize_disallows_flip(self, mock_context):
+        """Optimize always runs before BidirScanOffsetTransformer
+        (Phase::GeometryRefinement precedes Phase::PostProcessing,
+        regardless of list order). If Optimize is allowed to flip an
+        individual run's own recorded direction, a row split into
+        disjoint runs by a hole/gap in the content can end up with its
+        two halves independently reversed for travel efficiency --
+        decoupling them from the row's one true mechanical scan
+        direction. BidirScanOffsetTransformer's classification, made
+        afterward, then corrects one half and not the other for what
+        is physically a single pass. allow_flip=False keeps a run's
+        own recorded direction faithful to the original scan, so
+        travel reordering can't desync it from bidir's classification.
+        """
+        step = EngraveStep.create(mock_context, name="Created")
+        for t_dict in step.per_workpiece_transformers_dicts:
+            if t_dict.get("name") == "Optimize":
+                assert t_dict.get("allow_flip") is False
+                break
+        else:
+            pytest.fail("Optimize transformer not found")
+        for t_dict in step.per_step_transformers_dicts:
+            if t_dict.get("name") == "Optimize":
+                assert t_dict.get("allow_flip") is False
+                break
+        else:
+            pytest.fail("Optimize transformer not found")
+
     def test_serialization_includes_step_type(self):
         step = EngraveStep(name="Test")
         data = step.to_dict()

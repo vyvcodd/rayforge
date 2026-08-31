@@ -3,7 +3,7 @@
 from gettext import gettext as _
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
-from gi.repository import Adw, GLib, Gtk
+from gi.repository import Adw, Gtk
 
 from .....core.undo.property_cmd import ChangePropertyCommand
 from .....core.varset import VarSet
@@ -340,9 +340,7 @@ class StepSettingsPage(DebounceMixin, TrackedPreferencesPage):
         icon.set_tooltip_text(message if active else "")
 
     def _cleanup(self):
-        if self._debounce_timer > 0:
-            GLib.source_remove(self._debounce_timer)
-            self._debounce_timer = 0
+        self._cancel_all_debounced()
         for widget, _var_set in self._varset_widgets:
             widget.cancel_pending()
         config = self.editor.context.config

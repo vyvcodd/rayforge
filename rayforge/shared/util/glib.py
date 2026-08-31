@@ -21,30 +21,51 @@ def idle_add(func, *args, **kwargs):
 
 
 class DebounceMixin:
-    """A mixin to add debouncing capabilities to a class."""
+    """A mixin to add debouncing capabilities to a class.
+
+    Each distinct callback gets its own pending-timer slot, keyed by
+    the callback itself. A class that debounces more than one field
+    (e.g. a settings group with both a "passes" row and a "z step
+    down" row, each calling ``self._debounce(...)`` with its own
+    handler) previously shared a single slot: debouncing field B
+    within the delay window silently cancelled field A's pending
+    commit, so field A's change never reached the model. Keying by
+    callback keeps unrelated fields' debounces independent while still
+    coalescing rapid repeated edits to the *same* field, which is what
+    debouncing is for.
+    """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._debounce_timer = 0
-        self._debounced_callback: Callable | None = None
-        self._debounced_args: tuple = ()
+        self._debounce_timers: dict[Callable, int] = {}
+        self._debounce_pending_args: dict[Callable, tuple] = {}
 
     def _debounce(self, callback: Callable, *args: Any):
         """
-        Schedules a callback to be called after a short delay, cancelling any
-        previously scheduled callback.
+        Schedules ``callback`` to be called after a short delay,
+        cancelling any previously scheduled call to that *same*
+        callback (other callbacks debounced on this instance are
+        unaffected).
         """
-        if self._debounce_timer > 0:
-            GLib.source_remove(self._debounce_timer)
-        self._debounced_callback = callback
-        self._debounced_args = args
-        self._debounce_timer = GLib.timeout_add(
-            150, self._commit_debounced_change
+        existing = self._debounce_timers.get(callback)
+        if existing is not None:
+            GLib.source_remove(existing)
+        self._debounce_pending_args[callback] = args
+        self._debounce_timers[callback] = GLib.timeout_add(
+            150, self._commit_debounced_change, callback
         )
 
-    def _commit_debounced_change(self) -> bool:
-        """Executes the debounced callback and resets the timer."""
-        if self._debounced_callback:
-            self._debounced_callback(*self._debounced_args)
-        self._debounce_timer = 0
+    def _commit_debounced_change(self, callback: Callable) -> bool:
+        """Executes ``callback`` with its pending args and clears its
+        slot."""
+        args = self._debounce_pending_args.pop(callback, ())
+        self._debounce_timers.pop(callback, None)
+        callback(*args)
         return GLib.SOURCE_REMOVE
+
+    def _cancel_all_debounced(self):
+        """Cancels every pending debounced call without executing it."""
+        for timer_id in self._debounce_timers.values():
+            GLib.source_remove(timer_id)
+        self._debounce_timers.clear()
+        self._debounce_pending_args.clear()

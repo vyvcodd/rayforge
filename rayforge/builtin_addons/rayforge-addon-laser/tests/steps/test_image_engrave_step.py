@@ -47,3 +47,19 @@ class TestImageEngraveStep:
                 break
         else:
             pytest.fail("Optimize transformer not found")
+
+    def test_shortened_sweep_scan_mode_roundtrips(self):
+        step = ImageEngraveStep(name="Test")
+        step.scan_mode = "SHORTENED_SWEEP"  # type: ignore[assignment]
+        data = step.to_dict()
+        assert data["scan_mode"] == "SHORTENED_SWEEP"
+        restored = ImageEngraveStep.from_dict(data)
+        assert restored.scan_mode == "SHORTENED_SWEEP"
+
+    def test_get_assembler_kwargs_shortened_sweep_scan_mode(self, machine):
+        step = ImageEngraveStep(name="Test")
+        step.scan_mode = "SHORTENED_SWEEP"  # type: ignore[assignment]
+        workpiece = MagicMock(spec=["size"])
+        workpiece.size = (100, 100)
+        kwargs = step.get_assembler_kwargs(machine, workpiece)
+        assert kwargs["scan_mode"] == "shortened_sweep"

@@ -173,12 +173,15 @@ class ImageEngraveStep(LaserStep):
                     choices=[
                         (_("Segmented"), "SEGMENTED"),
                         (_("Full Sweep"), "FULL_SWEEP"),
+                        (_("Full Sweep (Shortened)"), "SHORTENED_SWEEP"),
                     ],
                     default="SEGMENTED",
                     description=_(
                         "Segmented: moves between content regions. "
                         "Full Sweep: scans full width with laser "
-                        "toggling"
+                        "toggling. Full Sweep (Shortened): one "
+                        "continuous sweep per row, trimmed to the "
+                        "row's content plus overscan"
                     ),
                     allow_none=False,
                 ),

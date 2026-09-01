@@ -177,12 +177,15 @@ class EngraveStep(LaserStep):
                     choices=[
                         (_("Segmented"), "SEGMENTED"),
                         (_("Full Sweep"), "FULL_SWEEP"),
+                        (_("Full Sweep (Shortened)"), "SHORTENED_SWEEP"),
                     ],
                     default="SEGMENTED",
                     description=_(
                         "Segmented: moves between content regions. "
                         "Full Sweep: scans full width with laser "
-                        "toggling"
+                        "toggling. Full Sweep (Shortened): one "
+                        "continuous sweep per row, trimmed to the "
+                        "row's content plus overscan"
                     ),
                     allow_none=False,
                 ),
@@ -645,8 +648,10 @@ class EngraveStep(LaserStep):
         scan_mode_map = {
             "SEGMENTED": "SEGMENTED",
             "FULL_SWEEP": "FULL_SWEEP",
+            "SHORTENED_SWEEP": "SHORTENED_SWEEP",
             "Segmented": "SEGMENTED",
             "FullSweep": "FULL_SWEEP",
+            "ShortenedSweep": "SHORTENED_SWEEP",
         }
         step.scan_mode = scan_mode_map.get(scan_mode_str, "SEGMENTED")
         step.cross_hatch = data.get(

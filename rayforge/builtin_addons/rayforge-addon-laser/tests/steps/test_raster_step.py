@@ -113,6 +113,14 @@ class TestEngraveStep:
         }
         assert set(kwargs.keys()) == expected_keys
 
+    def test_get_assembler_kwargs_shortened_sweep_scan_mode(self, machine):
+        step = EngraveStep(name="Test")
+        step.scan_mode = "SHORTENED_SWEEP"  # type: ignore[assignment]
+        workpiece = MagicMock(spec=["size"])
+        workpiece.size = (100, 100)
+        kwargs = step.get_assembler_kwargs(machine, workpiece)
+        assert kwargs["scan_mode"] == "shortened_sweep"
+
     def test_roundtrip_serialization(self):
         step = EngraveStep(name="Test")
         step.scan_angle = 45.0
@@ -123,6 +131,21 @@ class TestEngraveStep:
         restored = EngraveStep.from_dict(data)
         assert data == restored.to_dict()
         assert restored.dot_width_correction_mm == 0.05
+
+    def test_shortened_sweep_scan_mode_roundtrips(self):
+        step = EngraveStep(name="Test")
+        step.scan_mode = "SHORTENED_SWEEP"  # type: ignore[assignment]
+        data = step.to_dict()
+        assert data["scan_mode"] == "SHORTENED_SWEEP"
+        restored = EngraveStep.from_dict(data)
+        assert restored.scan_mode == "SHORTENED_SWEEP"
+
+    def test_shortened_sweep_scan_mode_legacy_alias_migrates(self):
+        step = EngraveStep(name="Test")
+        data = step.to_dict()
+        data["scan_mode"] = "ShortenedSweep"
+        restored = EngraveStep.from_dict(data)
+        assert restored.scan_mode == "SHORTENED_SWEEP"
 
     def test_legacy_power_keys_migrate(self):
         """Old files keyed the raster power range as min_power/max_power.

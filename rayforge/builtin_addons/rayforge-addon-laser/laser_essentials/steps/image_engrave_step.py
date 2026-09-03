@@ -525,7 +525,14 @@ class ImageEngraveStep(LaserStep):
         is baked into the :class:`Part` the assembler consumes, so any
         of these settings changing must invalidate the workpiece
         compute cache even though the assembler spec itself is
-        unchanged.
+        unchanged. ``bidir_x_offset_mm`` doesn't touch the image or
+        the assembler spec at all -- it only reaches
+        ``BidirScanOffsetTransformer`` via the step-settings dict
+        built at transformer-spec time (see
+        ``IntentBuilder._build_transformer_specs``'s docstring) -- so
+        it has to be folded in here too, or the compute cache never
+        notices it changed and keeps reusing the offset that was in
+        effect at the last *other* param change.
         """
         params = super().get_cache_params()
         params.update(
@@ -545,6 +552,7 @@ class ImageEngraveStep(LaserStep):
                     if self.dither_algorithm is not None
                     else None
                 ),
+                "bidir_x_offset_mm": self.bidir_x_offset_mm,
             }
         )
         return params

@@ -63,3 +63,24 @@ class TestImageEngraveStep:
         workpiece.size = (100, 100)
         kwargs = step.get_assembler_kwargs(machine, workpiece)
         assert kwargs["scan_mode"] == "shortened_sweep"
+
+    def test_cache_params_include_bidir_x_offset_mm(self):
+        """Regression test: bidir_x_offset_mm reaches
+        BidirScanOffsetTransformer purely through the step-settings
+        dict built at transformer-spec time, not through
+        get_assembler_kwargs() or the transformer's own to_dict() --
+        so it has to be in get_cache_params() or IntentBuilder's
+        compute token never changes when the user edits it, and the
+        pipeline keeps serving a stale, unoffset (or wrongly offset)
+        cached Ops artifact until some unrelated param happens to
+        bump the token.
+        """
+        step = ImageEngraveStep(name="Test")
+        step.bidir_x_offset_mm = 0.0
+        baseline = step.get_cache_params()
+
+        step.bidir_x_offset_mm = 3.0
+        changed = step.get_cache_params()
+
+        assert baseline != changed
+        assert changed["bidir_x_offset_mm"] == 3.0

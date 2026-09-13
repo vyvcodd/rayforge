@@ -103,3 +103,28 @@ def test_sync_from_model_preserves_pending_edit(editor, step):
 
     assert widget.get_values()["count"] == 9
     assert widget.get_values()["power"] == pytest.approx(0.5)
+
+
+def test_cleanup_commits_pending_edit_instead_of_discarding_it(editor, step):
+    """Closing the settings dialog must not discard an edit still
+    sitting in its debounce window.
+
+    Typing a value, hitting Enter, and closing the dialog right away
+    is a completely normal, fast sequence -- well within the 300ms
+    varset debounce. ``_cleanup`` previously called
+    ``widget.cancel_pending()``, which drops such an edit outright
+    instead of committing it, so it silently never reached the step.
+    """
+    page, widget = _make_page(editor, step)
+
+    count_adapter = widget.adapter_for("count")
+    assert count_adapter is not None
+    count_adapter.set_value(9)
+    widget._on_data_changed("count")
+    assert widget._pending_keys
+
+    page._cleanup()
+
+    assert step.count == 9
+    assert widget.get_values()["count"] == 9
+    assert not widget._pending_keys

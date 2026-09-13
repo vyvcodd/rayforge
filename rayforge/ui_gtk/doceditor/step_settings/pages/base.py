@@ -340,8 +340,20 @@ class StepSettingsPage(DebounceMixin, TrackedPreferencesPage):
         icon.set_tooltip_text(message if active else "")
 
     def _cleanup(self):
-        self._cancel_all_debounced()
+        """Tear down debounce timers when the settings dialog closes.
+
+        Flushes rather than cancels: closing the dialog right after an
+        edit (e.g. type a value, hit Enter, close) leaves that edit
+        still sitting in its debounce window (150ms for
+        ``DebounceMixin`` rows, 300ms for varset rows). Cancelling
+        would silently discard it -- committing was never fast enough
+        to lose the race against a normal close -- so the edit would
+        appear to revert the next time the dialog opens. Flushing
+        commits it to the model first, then removes the timer so it
+        cannot fire after the widgets are gone.
+        """
+        self._flush_all_debounced()
         for widget, _var_set in self._varset_widgets:
-            widget.cancel_pending()
+            widget.flush_pending()
         config = self.editor.context.config
         config.changed.disconnect(self._on_config_changed)

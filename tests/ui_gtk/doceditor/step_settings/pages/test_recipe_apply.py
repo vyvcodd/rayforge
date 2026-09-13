@@ -103,3 +103,37 @@ def test_sync_from_model_preserves_pending_edit(editor, step):
 
     assert widget.get_values()["count"] == 9
     assert widget.get_values()["power"] == pytest.approx(0.5)
+
+
+def test_config_changed_commits_pending_edit_instead_of_discarding_it(
+    editor, step
+):
+    """An unrelated config change must not silently discard an edit
+    still sitting in its debounce window.
+
+    ``config.changed`` fires for far more than machine switches --
+    Config wires the active machine's own ``changed`` signal straight
+    through to it, and several view preferences (grid/tabs/camera
+    visibility, ...) send it directly too. ``_on_config_changed``
+    rebuilds every varset section on each such event so
+    machine/unit-dependent rows stay current; that rebuild must flush
+    a pending edit into the model first, not silently revert it, since
+    ``VarSetWidget.set_values`` (unlike ``sync_from_model``) does not
+    check for pending edits.
+    """
+    page = StepSettingsPage(editor, step)
+    widget = page.add_varset_section("Params", step.recipe_varset())
+
+    speed_adapter = widget.adapter_for("cut_speed")
+    assert speed_adapter is not None
+    speed_adapter.set_value(750)
+    widget._on_data_changed("cut_speed")
+    assert widget._pending_keys
+
+    # Simulate an unrelated config change (e.g. a canvas-view toggle),
+    # not a real machine switch or recipe apply.
+    editor.context.config.changed.send(editor.context.config)
+
+    assert step.cut_speed == 750
+    assert widget.get_values()["cut_speed"] == 750
+    assert not widget._pending_keys

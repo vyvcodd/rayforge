@@ -219,14 +219,25 @@ class StepSettingsPage(DebounceMixin, TrackedPreferencesPage):
         self._update_machine_bounds()
 
     def _on_config_changed(self, *args):
-        """React to config changes (including active machine switches).
+        """React to config changes (active machine switches, unit
+        preference changes, and more -- ``config.changed`` also fires
+        for plenty of things unrelated to this page, such as canvas-
+        view toggles, since ``Config.set_machine`` wires the active
+        machine's own ``changed`` signal straight through to it).
 
         Rebuilds every varset section so machine-dependent vars (e.g.
-        head-selection dropdowns) pick up the new machine's heads, then
-        calls :meth:`_on_machine_changed` for subclass-specific
-        updates.
+        head-selection dropdowns) and unit-dependent labels/values pick
+        up the new state, then calls :meth:`_on_machine_changed` for
+        subclass-specific updates.
+
+        Any edit still sitting in a row's debounce window is flushed
+        to the model *before* rebuilding: ``widget.populate()`` tears
+        down and recreates the row widgets regardless, so without this
+        an edit the user is still mid-typing (not yet delivered to the
+        model) would be silently discarded rather than committed.
         """
         for i, (widget, old_var_set) in enumerate(self._varset_widgets):
+            widget.flush_pending()
             keys = {var.key for var in old_var_set}
             new_var_set = self._rebuild_varset(keys)
             if new_var_set is None:

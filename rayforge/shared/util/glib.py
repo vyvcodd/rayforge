@@ -69,3 +69,19 @@ class DebounceMixin:
             GLib.source_remove(timer_id)
         self._debounce_timers.clear()
         self._debounce_pending_args.clear()
+
+    def _flush_all_debounced(self):
+        """Immediately executes every pending debounced call, in place
+        of letting its timer fire later.
+
+        Use this instead of :meth:`_cancel_all_debounced` when the
+        owning object is about to go away (e.g. a dialog closing): a
+        cancelled call is simply dropped, discarding whatever edit is
+        still sitting in its debounce window, while a flush commits it
+        immediately.
+        """
+        callbacks = list(self._debounce_timers)
+        for callback in callbacks:
+            GLib.source_remove(self._debounce_timers.pop(callback))
+            args = self._debounce_pending_args.pop(callback, ())
+            callback(*args)

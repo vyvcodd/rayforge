@@ -127,3 +127,31 @@ class TestDebounceMixin:
         GLib.timeout_add(200, lambda: (waited.append(1), False)[1])
         _run_main_loop_until(lambda: waited)
         assert calls == []
+
+    def test_flush_all_debounced_commits_pending_calls_immediately(self):
+        """Regression test: closing a dialog right after an edit (type
+        a value, hit Enter, close) must commit that edit, not drop it.
+
+        Flushing must run the callback with its pending args and clear
+        its slot -- without waiting for the timer, and without leaving
+        it to fire again later.
+        """
+        obj = DebounceMixin()
+        calls_a = []
+        calls_b = []
+
+        obj._debounce(lambda value: calls_a.append(value), "first")
+        obj._debounce(lambda value: calls_b.append(value), "second")
+        obj._flush_all_debounced()
+
+        assert calls_a == ["first"]
+        assert calls_b == ["second"]
+        assert obj._debounce_timers == {}
+        assert obj._debounce_pending_args == {}
+
+        # The (now-removed) original timers must not fire again later.
+        waited = []
+        GLib.timeout_add(200, lambda: (waited.append(1), False)[1])
+        _run_main_loop_until(lambda: waited)
+        assert calls_a == ["first"]
+        assert calls_b == ["second"]

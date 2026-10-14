@@ -16,6 +16,7 @@ from raygeo.ops.part import Part
 from raygeo.ops.part.image_source import WholeImageSource
 
 from rayforge.core.capability import MachineCapability
+from rayforge.core.image_edit import ImageEditStep
 from rayforge.core.varset import (
     AngleVar,
     BoolVar,
@@ -80,7 +81,7 @@ class ImageEngraveStep(LaserStep):
         super().__init__(typelabel=typelabel or self.TYPELABEL, name=name)
         self.scan_angle = 0.0
         self.depth_mode = "POWER_MODULATION"
-        self.invert = False
+        self._legacy_invert = False
         self.auto_levels = True
         self.black_point = 0
         self.white_point = 255
@@ -228,14 +229,6 @@ class ImageEngraveStep(LaserStep):
                     min_val=-5.0,
                     max_val=5.0,
                     digits=3,
-                ),
-                BoolVar(
-                    key="invert",
-                    label=_("Invert"),
-                    description=_(
-                        "Engrave white areas instead of black areas"
-                    ),
-                    default=False,
                 ),
                 IntVar(
                     key="num_depth_levels",
@@ -537,7 +530,6 @@ class ImageEngraveStep(LaserStep):
         params = super().get_cache_params()
         params.update(
             {
-                "invert": self.invert,
                 "auto_levels": self.auto_levels,
                 "black_point": self.black_point,
                 "white_point": self.white_point,
@@ -557,11 +549,21 @@ class ImageEngraveStep(LaserStep):
         )
         return params
 
+    def pop_legacy_image_edits(self) -> list[ImageEditStep]:
+        """
+        Older files stored Invert on the step. It is now the "invert"
+        image edit on the workpieces, which reproduces it for the
+        visible pixels.
+        """
+        if not self._legacy_invert:
+            return []
+        self._legacy_invert = False
+        return [_LEGACY_INVERT]
+
     def to_dict(self) -> dict:
         result = super().to_dict()
         result["scan_angle"] = self.scan_angle
         result["depth_mode"] = self.depth_mode
-        result["invert"] = self.invert
         result["auto_levels"] = self.auto_levels
         result["black_point"] = self.black_point
         result["white_point"] = self.white_point
@@ -595,7 +597,7 @@ class ImageEngraveStep(LaserStep):
         step = cast("ImageEngraveStep", super().from_dict(data))
         step.scan_angle = data.get("scan_angle", 0.0)
         step.depth_mode = data.get("depth_mode", "POWER_MODULATION")
-        step.invert = data.get("invert", False)
+        step._legacy_invert = bool(data.get("invert", False))
         step.auto_levels = data.get("auto_levels", True)
         step.black_point = data.get("black_point", 0)
         step.white_point = data.get("white_point", 255)
@@ -850,19 +852,17 @@ def _build_raster_part(
         computed_auto_levels = compute_raster_auto_levels(
             workpiece,
             (px_per_mm_x, px_per_mm_y),
-            invert=step.invert,
         )
 
     part = Part(size_mm=size, pixels_per_mm=(px_per_mm_x, px_per_mm_y))
 
     if depth_mode != DepthMode.DITHER:
-        vips_image = workpiece.get_vips_image(target_w, target_h)
+        vips_image = workpiece.get_processed_image(target_w, target_h)
         if vips_image is None:
             return Part(size_mm=size), None
         gray_vips, alpha_vips = preprocess_raster_image_vips(
             vips_image,
             mode=depth_mode,
-            invert=step.invert,
             auto_levels=step.auto_levels,
             computed_auto_levels=computed_auto_levels,
             black_point=step.black_point,
@@ -929,7 +929,6 @@ def _build_raster_part(
     image, alpha = preprocess_raster_image(
         surface,
         mode=depth_mode,
-        invert=step.invert,
         auto_levels=step.auto_levels,
         computed_auto_levels=computed_auto_levels,
         black_point=step.black_point,
@@ -953,3 +952,5 @@ def _build_raster_part(
 
 
 MAX_RASTER_RENDER_PIXELS = 16 * 1024 * 1024
+
+_LEGACY_INVERT = ImageEditStep("invert")

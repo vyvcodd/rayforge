@@ -452,7 +452,6 @@ def preprocess_raster_image_vips(
     vips_image: "pyvips.Image",
     *,
     mode: DepthMode,
-    invert: bool = False,
     auto_levels: bool = True,
     computed_auto_levels: tuple[int, int] | None = None,
     black_point: int = 0,
@@ -510,19 +509,17 @@ def preprocess_raster_image_vips(
     gray = rgba[0:3].colourspace("b-w")
 
     if mode == DepthMode.CONSTANT_POWER:
-        # Matches raygeo's rgba_to_binary: burn (1) when strictly past
-        # threshold on the appropriate side; the threshold value itself
-        # never burns, in either direction. vips relational ops yield
+        # Matches raygeo's rgba_to_binary: burn (1) when strictly below
+        # threshold; the threshold value itself never burns. Inversion
+        # is the workpiece's Invert image edit, already applied to
+        # vips_image. vips relational ops yield
         # 0/255, not 0/1 -- ifthenelse maps that to the 0/1 convention
         # the assembler expects (a bare cast would keep 0/255).
-        mask = gray > threshold if invert else gray < threshold
+        mask = gray < threshold
         image = mask.ifthenelse(1, 0).cast("uchar")
         return image, alpha
 
     # MULTI_PASS / POWER_MODULATION.
-    if invert:
-        gray = 255 - gray
-
     if auto_levels:
         if computed_auto_levels is None:
             raise ValueError(

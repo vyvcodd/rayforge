@@ -3,6 +3,10 @@ from unittest.mock import MagicMock
 import pytest
 from laser_essentials.steps import ImageEngraveStep
 
+from rayforge.core.doc import Doc
+from rayforge.core.image_edit import ImageEditStep
+from rayforge.core.workpiece import WorkPiece
+
 
 @pytest.fixture
 def mock_context():
@@ -84,3 +88,67 @@ class TestImageEngraveStep:
 
         assert baseline != changed
         assert changed["bidir_x_offset_mm"] == 3.0
+
+
+LEGACY_INVERT = ImageEditStep("invert")
+
+
+def _image_engrave_step_dicts(data) -> list[dict]:
+    found = []
+    if isinstance(data, dict):
+        if data.get("step_type") == "ImageEngraveStep":
+            found.append(data)
+        for value in data.values():
+            found += _image_engrave_step_dicts(value)
+    elif isinstance(data, list):
+        for value in data:
+            found += _image_engrave_step_dicts(value)
+    return found
+
+
+class TestLegacyInvert:
+    """Invert moved from the step to the workpieces' image edits."""
+
+    def _saved(self, invert: bool) -> dict:
+        data = ImageEngraveStep(name="Image Engrave").to_dict()
+        data["invert"] = invert
+        return data
+
+    def test_invert_is_no_longer_a_step_setting(self):
+        step = ImageEngraveStep()
+        assert "invert" not in step.to_dict()
+        assert "invert" not in step.get_cache_params()
+        assert not hasattr(step, "invert")
+        keys = {var.key for var in ImageEngraveStep.recipe_varset()}
+        assert "invert" not in keys
+
+    def test_saved_invert_is_handed_over_once(self):
+        step = ImageEngraveStep.from_dict(self._saved(True))
+        assert "invert" not in step.extra
+        assert step.pop_legacy_image_edits() == [LEGACY_INVERT]
+        assert step.pop_legacy_image_edits() == []
+
+    def test_saved_invert_false_hands_over_nothing(self):
+        step = ImageEngraveStep.from_dict(self._saved(False))
+        assert step.pop_legacy_image_edits() == []
+
+    def test_saved_invert_is_not_written_back(self):
+        step = ImageEngraveStep.from_dict(self._saved(True))
+        assert "invert" not in step.to_dict()
+
+    def test_loading_a_document_moves_invert_to_the_workpieces(self):
+        doc = Doc()
+        wp = WorkPiece("photo")
+        doc.active_layer.add_child(wp)
+        doc.active_layer.workflow.add_step(
+            ImageEngraveStep(name="Image Engrave")
+        )
+        data = doc.to_dict()
+        _image_engrave_step_dicts(data)[0]["invert"] = True
+
+        restored = Doc.from_dict(data)
+
+        (restored_wp,) = restored.all_workpieces
+        assert restored_wp.image_edits == (LEGACY_INVERT,)
+        again = Doc.from_dict(restored.to_dict())
+        assert again.all_workpieces[0].image_edits == (LEGACY_INVERT,)

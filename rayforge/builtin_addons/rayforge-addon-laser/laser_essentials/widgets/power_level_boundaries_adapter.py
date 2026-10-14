@@ -42,11 +42,11 @@ class PowerLevelBoundariesAdapter(RowAdapter):
     widget out into the side panel via :meth:`detach_widget`.
 
     The histogram it shows is the *final* brightness distribution --
-    after invert, auto/manual levels, and the power curve -- since
+    after image edits, auto/manual levels, and the power curve -- since
     that's the actual input the boundaries partition (matching
     ``_boundaries_to_lut``'s place in the pipeline, right before the
     raster assembler's own quantization). It therefore needs the
-    sibling auto_levels/black_point/white_point/curve_points/invert/
+    sibling auto_levels/black_point/white_point/curve_points/
     num_power_levels/min_power_level/max_power_level values, supplied
     via :meth:`update_from_values`, to recompute both the band count
     and the histogram whenever any of those change -- not just its own
@@ -111,7 +111,7 @@ class PowerLevelBoundariesAdapter(RowAdapter):
         No-op without a histogram source. Separate from the
         levels/curve-processed histogram pushed to the widget, since
         those two only need to be redone at different times: raw
-        samples only when the image/invert actually changes, the
+        samples only when the image actually changes, the
         processed histogram whenever any tone setting changes too.
         """
         step = self._step
@@ -142,11 +142,7 @@ class PowerLevelBoundariesAdapter(RowAdapter):
             surface = workpiece.render_to_pixels(width_px, height_px)
             if not surface:
                 continue
-            # Un-inverted here -- update_from_values applies the
-            # step's current invert flag when building the processed
-            # histogram below, same as LevelsAdapter does for its own
-            # (raw, but invert-dependent) histogram.
-            gray_values = get_visible_grayscale_values(surface, False)
+            gray_values = get_visible_grayscale_values(surface)
             if gray_values.size > 0:
                 all_gray_values.append(gray_values)
 
@@ -161,8 +157,6 @@ class PowerLevelBoundariesAdapter(RowAdapter):
             return
         ctx = self._last_context or {}
         gray = self._raw_gray
-        if ctx.get("invert"):
-            gray = 255 - gray
 
         auto_levels = bool(ctx.get("auto_levels", True))
         if auto_levels:
@@ -205,7 +199,6 @@ class PowerLevelBoundariesAdapter(RowAdapter):
             self.widget.set_power_range(float(min_p), float(max_p))
 
         context = (
-            bool(values.get("invert", False)),
             bool(values.get("auto_levels", True)),
             values.get("black_point"),
             values.get("white_point"),
@@ -213,10 +206,9 @@ class PowerLevelBoundariesAdapter(RowAdapter):
         )
         if context != self._last_context_key():
             self._last_context = {
-                "invert": context[0],
-                "auto_levels": context[1],
-                "black_point": context[2],
-                "white_point": context[3],
+                "auto_levels": context[0],
+                "black_point": context[1],
+                "white_point": context[2],
                 "curve_points": values.get("curve_points"),
             }
             self._push_histogram()
@@ -226,7 +218,6 @@ class PowerLevelBoundariesAdapter(RowAdapter):
             return None
         c = self._last_context
         return (
-            c["invert"],
             c["auto_levels"],
             c["black_point"],
             c["white_point"],

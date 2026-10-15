@@ -13,6 +13,7 @@ from laser_essentials.steps import (
     ContourStep,
     EngraveStep,
     FrameStep,
+    ImageEngraveStep,
     MaterialTestStep,
     ShrinkWrapStep,
 )
@@ -46,6 +47,7 @@ def _register_steps():
     step_registry.register(ContourStep, addon_name="laser_essentials")
     step_registry.register(EngraveStep, addon_name="laser_essentials")
     step_registry.register(FrameStep, addon_name="laser_essentials")
+    step_registry.register(ImageEngraveStep, addon_name="laser_essentials")
     step_registry.register(MaterialTestStep, addon_name="laser_essentials")
     step_registry.register(ShrinkWrapStep, addon_name="laser_essentials")
 
